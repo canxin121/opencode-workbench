@@ -13,6 +13,16 @@ Add to your OpenCode config (`.opencode/opencode.jsonc`):
 ```jsonc
 {
   "plugin": [
+    "opencode-workbench"
+  ]
+}
+```
+
+Optionally pin a version:
+
+```jsonc
+{
+  "plugin": [
     "opencode-workbench@0.1.0"
   ]
 }
@@ -85,6 +95,14 @@ stage = "tracked"
 commitBodyAuto = true
 lockTimeout = 3600
 ```
+
+## Publishing (npm)
+
+Suggested checklist before `npm publish`:
+
+- Update `package.json` version
+- Run `bun run publish:check`
+- Ensure `npm whoami` works and publish with the right access (scoped packages usually need `--access public`)
 
 ## One-command fork + sandbox
 
