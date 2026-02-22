@@ -1,0 +1,44 @@
+{
+  "name": "opencode-workbench",
+  "version": "0.1.0",
+  "description": "Branch sandboxes for parallel OpenCode development",
+  "type": "module",
+  "packageManager": "bun@1.3.6",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bunx tsup src/index.ts --format esm --dts",
+    "dev": "bunx tsup src/index.ts --watch --format esm --dts",
+    "typecheck": "bunx tsc -p tsconfig.json --noEmit",
+    "selfcheck": "bun script/selfcheck.ts",
+    "lint": "bunx eslint . --ext .ts",
+    "lint:fix": "bunx eslint . --ext .ts --fix"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "*",
+    "@types/node": "^25.0.9",
+    "bun-types": "^1.3.6",
+    "eslint": "^9.39.2",
+    "@eslint/js": "^9.39.2",
+    "@typescript-eslint/eslint-plugin": "^8.53.0",
+    "@typescript-eslint/parser": "^8.53.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
+  },
+  "license": "MIT"
+}
