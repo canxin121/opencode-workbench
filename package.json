@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Branch sandboxes for parallel OpenCode development",
   "type": "module",
+  "opencodeStudio": {
+    "manifest": "dist/studio.manifest.json"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/canxin121/opencode-workbench.git"
@@ -40,13 +43,14 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "bunx tsup src/index.ts --format esm --dts",
-    "dev": "bunx tsup src/index.ts --watch --format esm --dts",
+    "build": "tsup",
+    "dev": "tsup --watch",
     "typecheck": "bunx tsc -p tsconfig.json --noEmit",
     "prepack": "bun run typecheck && bun run build",
     "pack:check": "npm pack --dry-run",
     "publish:check": "bun run prepack && npm pack --dry-run",
     "selfcheck": "bun script/selfcheck.ts",
+    "studio:bridge:selfcheck": "bun script/studio-bridge-selfcheck.ts",
     "lint": "bunx eslint . --ext .ts",
     "lint:fix": "bunx eslint . --ext .ts --fix"
   },
