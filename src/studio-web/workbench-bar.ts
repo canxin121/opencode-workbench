@@ -60,6 +60,7 @@ type Snapshot = {
 type State = {
   sessionId: string
   collapsed: boolean
+  detailsOpen: boolean
   loading: boolean
   busy: boolean
   error: string | null
@@ -100,6 +101,12 @@ function iconSvg(name: string, className: string): string {
   const common = `class="${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"`
   if (name === "wrench") {
     return `<svg ${common}><path d="M14.7 6.3a4 4 0 0 0-5.6 5.6l-6.2 6.2a2 2 0 0 0 2.8 2.8l6.2-6.2a4 4 0 0 0 5.6-5.6l-2.1 2.1-2.8-2.8 2.1-2.1Z"/></svg>`
+  }
+  if (name === "help") {
+    return `<svg ${common}><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 1 1 5.82 1c0 2-3 2-3 4"/><path d="M12 17h.01"/></svg>`
+  }
+  if (name === "x") {
+    return `<svg ${common}><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>`
   }
   if (name === "refresh") {
     return `<svg ${common}><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>`
@@ -191,6 +198,7 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
   const state: State = {
     sessionId,
     collapsed: true,
+    detailsOpen: false,
     loading: false,
     busy: false,
     error: null,
@@ -276,11 +284,25 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
     state.collapsed = !state.collapsed
     if (state.collapsed) {
       state.showAll = false
+      state.detailsOpen = false
       render()
       scheduleReserveUpdate()
       return
     }
     void refreshAll()
+  }
+
+  function toggleDetails() {
+    state.detailsOpen = !state.detailsOpen
+    render()
+    scheduleReserveUpdate()
+  }
+
+  function closeDetails() {
+    if (!state.detailsOpen) return
+    state.detailsOpen = false
+    render()
+    scheduleReserveUpdate()
   }
 
   function toggleAll() {
@@ -334,6 +356,50 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
     `
   }
 
+  function renderDetails(snap: Snapshot): string {
+    const cfg = snap.config
+    const cfgStatus =
+      cfg.status === "loaded" ? "Config loaded" : cfg.status === "invalid" ? "Config invalid" : "Config missing"
+    const cfgBadge =
+      cfg.status === "loaded"
+        ? '<span class="text-[10px] px-1 rounded bg-emerald-500/15 text-emerald-700">Loaded</span>'
+        : cfg.status === "invalid"
+          ? '<span class="text-[10px] px-1 rounded bg-rose-500/15 text-rose-700">Invalid</span>'
+          : '<span class="text-[10px] px-1 rounded bg-muted text-muted-foreground">Missing</span>'
+
+    const count = snap.sandboxes.length
+    const all = snap.sandboxesAllCount
+    const countLabel = all && all !== count ? `${count} (all=${all})` : String(count)
+
+    return `
+      <div class="text-[11px] text-muted-foreground leading-snug space-y-2">
+        <div class="space-y-1">
+          <div class="flex items-start gap-2">
+            <span class="shrink-0 font-medium text-foreground/80">Project:</span>
+            <span class="min-w-0 truncate" title="${htmlEscape(snap.projectRoot)}">${htmlEscape(
+              snap.projectRoot || "(unknown)",
+            )}</span>
+          </div>
+          <div class="flex items-center justify-between gap-2">
+            <div class="min-w-0 flex items-center gap-2">
+              <span class="shrink-0 font-medium text-foreground/80">Config:</span>
+              <span class="min-w-0 truncate" title="${htmlEscape(cfg.path)}">${htmlEscape(cfg.path)}</span>
+            </div>
+            <div class="shrink-0" title="${htmlEscape(cfgStatus)}">${cfgBadge}</div>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="font-medium text-foreground/80">Sandboxes:</span>
+            <span>${htmlEscape(countLabel)}</span>
+          </div>
+        </div>
+        <div class="rounded-md border border-border/40 bg-background/50 p-2">
+          <div class="pb-1 text-[11px] font-semibold text-foreground/85">Tooling</div>
+          ${renderDeps(snap)}
+        </div>
+      </div>
+    `
+  }
+
   function renderSandboxes(snap: Snapshot): string {
     const list = state.showAll ? snap.sandboxes : snap.sandboxes.slice(0, 6)
     if (!list.length) {
@@ -374,27 +440,33 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
 
   function renderExpandedPanel(): string {
     const snap = state.snapshot
-    const cfg = snap?.config
-    const cfgBadge = !cfg
-      ? ""
-      : cfg.status === "loaded"
-        ? '<span class="text-[10px] px-1 rounded bg-emerald-500/15 text-emerald-700">Config loaded</span>'
-        : cfg.status === "invalid"
-          ? '<span class="text-[10px] px-1 rounded bg-rose-500/15 text-rose-700">Config invalid</span>'
-          : '<span class="text-[10px] px-1 rounded bg-muted text-muted-foreground">Config missing</span>'
 
     const errorBlock = state.error
       ? `<div class="rounded bg-destructive/10 px-2 py-1.5 text-xs text-destructive flex items-start gap-2"><span class="font-bold">Error:</span> ${htmlEscape(state.error)}</div>`
+      : ""
+
+    const countBadge = snap
+      ? `<span class="text-[10px] px-1 rounded bg-primary/10 text-primary">${snap.sandboxes.length}</span>`
       : ""
 
     const header = `
       <div class="flex items-center border-b border-border/30 bg-muted/20 gap-2 px-2 py-1">
         <div class="flex items-center gap-2 min-w-0 flex-1">
           <span class="truncate text-[11px] font-semibold text-foreground/90 select-none cursor-default" title="Workbench">Workbench</span>
-          ${cfgBadge}
+          ${countBadge}
           ${state.loading ? '<span class="animate-pulse text-[10px] text-muted-foreground">Updating...</span>' : ""}
         </div>
         <div class="flex items-center gap-0.5">
+          <button
+            type="button"
+            data-wb-action="details"
+            class="h-7 w-7 inline-flex items-center justify-center rounded ${state.detailsOpen ? "bg-muted/40" : "hover:bg-muted/40"}"
+            title="Details"
+            aria-label="Details"
+            aria-pressed="${state.detailsOpen}"
+          >
+            ${iconSvg("help", "h-3.5 w-3.5 text-muted-foreground/80")}
+          </button>
           <button
             type="button"
             data-wb-action="refresh"
@@ -422,11 +494,6 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
       ? `<div class="py-2 text-center text-xs text-muted-foreground italic leading-relaxed">${state.loading ? "Checking workbench..." : "No data yet."}</div>`
       : `
           <div class="flex flex-col gap-2">
-            <div class="text-[11px] text-muted-foreground leading-snug">
-              <div><span class="font-medium text-foreground/80">Project</span>: <span class="truncate" title="${htmlEscape(snap.projectRoot)}">${htmlEscape(snap.projectRoot || "(unknown)")}</span></div>
-              <div><span class="font-medium text-foreground/80">Config</span>: <span class="truncate" title="${htmlEscape(snap.config.path)}">${htmlEscape(snap.config.path)}</span></div>
-              <div><span class="font-medium text-foreground/80">Sandboxes</span>: ${snap.sandboxes.length}${snap.sandboxesAllCount !== snap.sandboxes.length ? ` (all=${snap.sandboxesAllCount})` : ""}</div>
-            </div>
             <div class="rounded-md border border-border/40 bg-background/50 p-2">
               <div class="flex items-center gap-2 pb-1 text-[11px] font-semibold text-foreground/85">${iconSvg(
                 "list",
@@ -434,20 +501,56 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
               )}<span>Sandboxes</span></div>
               ${renderSandboxes(snap)}
             </div>
-            <div class="rounded-md border border-border/40 bg-background/50 p-2">
-              <div class="pb-1 text-[11px] font-semibold text-foreground/85">Tooling</div>
-              ${renderDeps(snap)}
-            </div>
           </div>
         `
 
+    const details = snap && state.detailsOpen
+      ? `
+          <div class="absolute inset-0">
+            <button
+              type="button"
+              data-wb-action="detailsClose"
+              class="absolute inset-0 bg-background/70 backdrop-blur-sm"
+              aria-label="Close details"
+            ></button>
+            <div class="absolute top-2 bottom-2 left-2 right-2">
+              <div class="pointer-events-auto w-full h-full rounded-lg border border-border/60 bg-background/95 shadow-xl backdrop-blur-md overflow-hidden flex flex-col">
+                <div class="flex items-center justify-between gap-2 border-b border-border/30 bg-muted/20 px-2 py-1">
+                  <div class="text-[11px] font-semibold text-foreground/90">Details</div>
+                  <button
+                    type="button"
+                    data-wb-action="detailsClose"
+                    class="h-7 w-7 inline-flex items-center justify-center rounded hover:bg-muted/40"
+                    title="Close"
+                    aria-label="Close"
+                  >
+                    ${iconSvg("x", "h-3.5 w-3.5 text-muted-foreground/80")}
+                  </button>
+                </div>
+                <div class="p-2 overflow-y-auto flex-1 min-h-0">
+                  ${renderDetails(snap)}
+                </div>
+              </div>
+            </div>
+          </div>
+        `
+      : ""
+
+    const shellStyle = state.detailsOpen
+      ? "min-height: clamp(200px, 26vh, 280px); max-height: min(50vh, 420px);"
+      : "max-height: 50vh;"
+
     return `
-      <section class="pointer-events-auto w-full rounded-lg border border-border/60 bg-background/95 shadow-xl backdrop-blur-md overflow-hidden transition-all duration-300 ease-in-out flex flex-col max-h-[50vh]">
+      <section
+        class="pointer-events-auto relative w-full rounded-lg border border-border/60 bg-background/95 shadow-xl backdrop-blur-md overflow-hidden transition-all duration-300 ease-in-out flex flex-col"
+        style="${shellStyle}"
+      >
         ${header}
         <div class="overflow-y-auto overscroll-contain flex-1 min-h-0 flex flex-col p-2 gap-2">
           ${body}
           ${errorBlock}
         </div>
+        ${details}
       </section>
     `
   }
@@ -470,6 +573,14 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
     const action = String(actionEl.dataset.wbAction || "").trim()
     if (action === "toggle") {
       toggleCollapsed()
+      return
+    }
+    if (action === "details") {
+      toggleDetails()
+      return
+    }
+    if (action === "detailsClose") {
+      closeDetails()
       return
     }
     if (action === "refresh") {
