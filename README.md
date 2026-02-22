@@ -24,8 +24,17 @@ For local development, you can also load it via `file://` (point to a built JS f
 
 The plugin exposes a single tool: `workbench`.
 
+Full help:
+
+```text
+workbench { action: "help" }
+```
+
+Use this tool when you need parallel work across branches/worktrees (git worktree, GitHub fork, multiple branches at once).
+
 Actions:
 
+- `help`: show full usage help.
 - `create`: create a git worktree (optional), build a sandbox copy, and create a child session pinned to that sandbox.
 - `create` with `github=true`: also runs `gh` + local `git` remote wiring (ensure fork exists, add/repair fork+upstream remotes) in the same invocation.
 - `list`: list known sandboxes.

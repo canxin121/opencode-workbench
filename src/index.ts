@@ -8,10 +8,115 @@ const META = ".opencode-workbench.json"
 
 const DEFAULT_EXCLUDE = [".git", META, "node_modules", "dist", "build", ".next", ".turbo", "coverage", ".cache", "target", ".DS_Store"]
 
-const DESCRIPTION = `Manage per-branch sandboxes (temporary directory copies) for parallel development.
+const INJECTION = `Parallel branch/worktree tasks: use workbench to create an isolated sandbox + pinned session (avoid editing the wrong directory).
+Help: workbench { action: "help" }`
 
-Why: when running multiple OpenCode sessions across branches/worktrees, it's easy to accidentally edit files in the wrong folder.
-This tool creates an isolated sandbox copy and pins the created child session to that sandbox directory.
+const DESCRIPTION = INJECTION
+
+const HELP = `opencode-workbench (tool: workbench)
+
+Purpose
+- Create isolated per-branch sandboxes (temporary code copies) for parallel work.
+- Create child sessions pinned to the sandbox directory to avoid editing the wrong branch/worktree.
+- Sync/publish changes back to the recorded source worktree with safety checks + locking.
+
+When to use
+- If the user requests parallel work across branches/worktrees (git worktree, forks, multiple branches at once), use this tool.
+
+Get help
+- Run: workbench { action: "help" }
+
+Project configuration (recommended)
+- File: .opencode/workbench.toml  (same folder as .opencode/opencode.json*)
+- Precedence: tool args > workbench.toml > safe defaults
+- Diagnose config + tooling: workbench { action: "doctor" }
+
+Common workflows
+
+1) Create a sandbox + pinned session
+  workbench { action: "create" }
+  workbench { action: "create", branch: "feature/my-thing" }
+
+2) GitHub fork + remotes wiring (single invocation)
+  workbench { action: "create", github: true, branch: "feature/my-thing" }
+
+3) Include local edits/untracked files in the sandbox
+  workbench { action: "create", copyMode: "worktree" }
+
+4) Preview what would sync (dry-run; requires rsync)
+  workbench { action: "preview", sandbox: "<name>" }
+  workbench { action: "preview", sandbox: "<name>", delete: true }
+
+5) Sync sandbox -> worktree
+  workbench { action: "sync", sandbox: "<name>" }
+
+6) Publish (sync + commit + optional push/PR)
+  workbench { action: "publish", sandbox: "<name>" }
+
+Actions
+- help: show this help text
+- list: list known sandboxes
+- info: show sandbox metadata (paths/session/pr/publish info)
+- doctor: check git/gh/rsync/tar + repo wiring + config status
+- create: (optionally) make a managed git worktree, create sandbox, create pinned child session
+- open: create a pinned child session for an existing sandbox
+- preview: rsync dry-run from sandbox -> targetWorktree
+- sync: copy sandbox -> targetWorktree (default: no deletions)
+- publish: sync -> commit -> push/pr (optional) with safety checks
+- checkpoint: copy an existing sandbox into a new sandbox
+- reset: rebuild sandbox from sourceWorktree (default: checkpoint backup first)
+- rename: rename a managed sandbox directory (use force=true if it has a recorded session)
+- gc: garbage-collect old/orphan sandboxes (dry-run unless gcApply=true)
+- cleanup: remove sandbox and optionally the managed worktree
+
+High-impact options
+
+Copying
+- copyMode: "archive" | "worktree"
+  - archive: git archive (tracked+committed files only)
+  - worktree: filesystem snapshot (includes local edits/untracked; uses rsync if available)
+- copyExcludeMode: "append" | "replace"
+  - append: DEFAULT_EXCLUDE + copyExclude
+  - replace: only copyExclude
+- copyExclude: string[] (patterns are passed to rsync --exclude)
+
+Sync/publish safety
+- delete: when true, propagate deletions from sandbox to target (requires rsync)
+- allowDirty: when false (default), target worktree must be clean before delete/publish
+- lockTimeout: lock TTL seconds for sync/publish/reset; force=true breaks stale locks
+
+Publish controls
+- commit: set false to sync only (no commit)
+- stage: "all" (git add -A) | "tracked" (git add -u)
+- commitBodyAuto: when true and commitBody is empty, generate a file list body
+- noVerify: pass --no-verify to git commit
+- sign: keep commit signing enabled (default false -> use --no-gpg-sign)
+
+GitHub / PR
+- github: run gh wiring (fork + remotes + optional fetch)
+- push: push branch to fork
+- pr: create/reuse PR on upstream; also updates labels/reviewers/assignees when PR exists
+
+Examples: .opencode/workbench.toml
+
+copyMode = "worktree"
+copyExcludeMode = "append"
+copyExclude = ["node_modules", "dist", "build"]
+
+github = true
+ghHost = "github.com"
+upstreamRemote = "upstream"
+forkRemote = "fork"
+protocol = "auto"
+fetch = true
+
+pr = true
+draft = true
+prLabels = ["workbench"]
+
+stage = "tracked"
+commitBodyAuto = true
+lockTimeout = 3600
 `
 
 type Meta = {
@@ -981,11 +1086,18 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
   }
 
   return {
+    "experimental.chat.system.transform": async (_input, output) => {
+      output.system.push(INJECTION)
+    },
+    "experimental.session.compacting": async (_input, output) => {
+      output.context.push(INJECTION)
+    },
     tool: {
       workbench: tool({
         description: DESCRIPTION,
         args: {
           action: tool.schema.enum([
+            "help",
             "create",
             "open",
             "list",
@@ -1158,6 +1270,10 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
 
           const conf0 = await loadConfig(getBase(ctx))
           const opt0 = { ...conf0.config, ...args } as any
+
+          if (args.action === "help") {
+            return HELP
+          }
 
           if (args.action === "list") {
             const items = await allSandboxes(r.base)
