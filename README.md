@@ -87,9 +87,18 @@ Task isolation:
 
 Suggested governance workflow:
 
+- Supervisor session focuses on orchestration; child sessions do implementation.
+- Supervisor should not edit child implementation files directly; route file work to child sessions.
+- Build/check/fmt/test should run in the target child worktree session (not supervisor) to avoid wrong-directory execution.
+- If changes are in child worktrees, supervisor-local build/check/fmt/test is usually meaningless and should be skipped.
 - Child sessions run their own `git commit`, `git push`, and `gh pr merge`.
-- Supervisor session coordinates and confirms approval with the user before those steps.
+- Child reports readiness with suggested next delivery steps; supervisor decides routing.
+- For commit/push/PR/merge/cleanup milestones, supervisor should proactively confirm user approval and require green PR checks/GitHub Actions before merge; if checks fail, route fixes back to child.
+- Unless user approval is already explicit/preapproved, supervisor should ask before each next delivery/cleanup step and, after each step result, ask whether to continue.
 - User may preapprove those delivery actions; supervisor should restate the approval in the prompt flow.
+- Prefer child-session reuse (`open/list/info` first) and only create new child sessions when necessary.
+- For cleanup actions (binding removal, storage cleanup, remote branch cleanup), supervisor should confirm with the user first unless already requested.
+- For cold-start heavy stacks, supervisor should decide and coordinate safe cache seeding into new worktrees (for example `node_modules`, `cargo target`, or other tool caches) when compatible.
 
 ## Configuration
 

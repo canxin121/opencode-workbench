@@ -4,11 +4,10 @@ import path from "node:path"
 import os from "node:os"
 import { createHash, randomBytes } from "node:crypto"
 
-const INJECTION = `Use workbench when you need concurrent work across branches/worktrees.
+const INJECTION = `Use workbench for concurrent branch/worktree tasks.
 
-- It binds a worktree directory to a pinned OpenCode session and stores metadata for Studio.
-- Typical flow: workbench { action: "open", dir: ".workbench/<name>", name: "<name>" } then workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.
-- task_id is optional when you want explicit routing.
+- workbench binds a worktree directory to a pinned OpenCode session and stores metadata for Studio.
+- Use it when multiple tasks/branches run in parallel and you need clear per-worktree routing.
 
 Help: workbench { action: "help" }`
 
@@ -23,6 +22,9 @@ Purpose
 - Records metadata (worktree path, branch, fork, PR URL) so OpenCode Studio UI can display it.
 - Includes a task action for directory-aware subagent execution in bound worktrees.
 
+When to use
+- Use workbench when multiple branches/worktrees are active in parallel and you need explicit task routing.
+
 Common workflow
 1) Ensure worktrees stay inside the repo directory:
    Add .workbench/ to the repo's .gitignore
@@ -35,6 +37,7 @@ Common workflow
    (task_id auto-routes when possible)
 5) Update GitHub metadata (optional):
    workbench { action: "bind", prUrl: "https://..." }
+6) Before merge, ensure PR checks/GitHub Actions are green, then ask user approval for merge.
 
 Actions
 - help: show this help text
@@ -60,21 +63,28 @@ Session targeting
 - sessionId: optional child/target session id; useful when parent and child both need visibility
 - strict: for info, fail on ambiguous matches instead of choosing the latest
 
+Role policy
+- Role-specific workflow rules are injected automatically for supervisor and implementation sessions.
+- Supervisor owns orchestration and can decide safe cache/artifact seeding for new worktrees when useful.
+- Implementation sessions execute and verify inside their bound worktree, then report readiness and CI status.
+
 Storage
 - Registry files live under: $XDG_STATE_HOME/opencode/workbench/entries/
   (fallback: ~/.local/state/opencode/workbench/entries/)`
 
 const SUPERVISOR_HINT = `Workbench mode: this is a supervisor session.
-- Prefer orchestration work here (git/gh/workbench).
-- For implementation prompts, use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.
-- Coordinate and approve child git/gh delivery steps based on user intent.
-- Keep direct edits here minimal; .gitignore updates for .workbench setup are allowed.`
+- Own orchestration only: planning, routing, review, and user communication.
+- MUST NOT edit child implementation files or run build/check/fmt/test/git/gh for child-worktree changes in this session.
+- Route child implementation changes (feature/code/file work) and verification commands to the target child session, and collect results there.
+- For new/heavy worktrees, proactively decide language/tool-specific acceleration (for example seeding node_modules, cargo target, or other reusable caches) when safe for this repo.
+- Delivery flow (commit -> push -> PR -> merge -> cleanup): first collect child readiness + CI/GitHub Actions status, and do not move toward merge unless checks are green.
+- Unless user approval is already explicit/preapproved, ask before each next step; after each completed step, report outcome and ask whether to continue.`
 
 const IMPLEMENTATION_HINT = `Workbench mode: this session is pinned to a workbench worktree.
-- Keep file edits inside this worktree only.
-- Prefer running implementation prompts via workbench { action: "task", prompt: "..." } in this session scope.
-- Ask supervisor for approval before git commit/push/gh pr merge.
-- Handle your own git commit/push/pr merge after approval; supervisor coordinates and user approves policy.`
+- Execute all implementation and repo actions for this worktree (edits/build/check/fmt/test/git/gh) only inside this path.
+- Delivery flow (commit -> push -> PR -> merge -> cleanup): execute only the step requested by supervisor.
+- After push/PR, check CI/GitHub Actions and report status; if checks fail, fix in this session and rerun.
+- Merge/delivery only when checks are green and supervisor confirms user approval (unless already explicitly preapproved).`
 
 type Entry = {
   version: 1
@@ -897,7 +907,7 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
     },
     "tool.definition": async (input, output) => {
       if (input.toolID !== "task") return
-      output.description = `${output.description}\n\nWorkbench integration:\n- In supervisor/implementation workbench sessions, built-in task directory routing is guarded.\n- Use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." } for directory-aware implementation prompts.\n- If task_id is omitted in those sessions, workbench can still auto-route when unambiguous.`
+      output.description = `${output.description}\n\nWorkbench note:\n- workbench is for concurrent branch/worktree tasks.\n- For directory-aware execution, use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.\n- In workbench supervisor/implementation sessions, built-in task directory input is disabled; workbench can auto-route task_id when unambiguous.`
     },
     "tool.execute.before": async (input, output) => {
       const base = stateHome()
@@ -971,7 +981,7 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
       if (isGitignore(target)) return
 
       throw new Error(
-        'workbench: supervisor sessions should not edit files directly. Use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." } in a pinned session; only .gitignore edits are allowed here.',
+        'workbench: supervisor sessions MUST NOT edit child implementation files. Route edits via workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }; only .gitignore setup edits are allowed here.',
       )
     },
     tool: {
