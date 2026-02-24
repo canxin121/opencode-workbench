@@ -22,6 +22,10 @@ const studioManifest = {
     {
       surface: "chat.overlay.bottom",
       title: "Workbench",
+      titleI18n: {
+        "en-US": "Workbench",
+        "zh-CN": "工作台",
+      },
       entry: studioWebEntry,
       mode: "module",
     },

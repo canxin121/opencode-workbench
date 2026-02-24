@@ -23,6 +23,7 @@ export type StudioMountOptions = {
   context: Record<string, string>
   host: HostApi
   layout?: LayoutApi
+  close?: () => void
 }
 
 type Snapshot = {
@@ -73,6 +74,119 @@ type State = {
   busy: boolean
   error: string | null
   snapshot: Snapshot | null
+}
+
+type LocaleCode = "en-US" | "zh-CN"
+
+type UiStrings = {
+  workbench: string
+  showWorkbench: string
+  scopeRepoBadge: string
+  scopeSessionBadge: string
+  updating: string
+  toggleScope: string
+  scopeButtonSession: string
+  scopeButtonRepo: (count: number) => string
+  showDetails: string
+  hideDetails: string
+  refresh: string
+  collapse: string
+  close: string
+  checkingWorkbench: string
+  noDataYet: string
+  info: string
+  bindings: string
+  depOk: string
+  depMissing: string
+  noBindingsRepo: string
+  noBindingSession: string
+  repoNotDetected: string
+  unknown: string
+  metaRepo: (value: string) => string
+  metaScope: (value: string) => string
+  metaSession: (value: string) => string
+  metaParent: (value: string) => string
+  metaChild: (value: string) => string
+  metaBindings: (sessionCount: number, repoCount: number, allCount: number) => string
+  errorPrefix: string
+  snapshotUnavailable: string
+}
+
+const UI_I18N: Record<LocaleCode, UiStrings> = {
+  "en-US": {
+    workbench: "Workbench",
+    showWorkbench: "Show workbench",
+    scopeRepoBadge: "repo",
+    scopeSessionBadge: "session",
+    updating: "Updating...",
+    toggleScope: "Toggle scope",
+    scopeButtonSession: "Session",
+    scopeButtonRepo: (count) => (count > 0 ? `Repo (${count})` : "Repo"),
+    showDetails: "Show details",
+    hideDetails: "Hide details",
+    refresh: "Refresh",
+    collapse: "Collapse",
+    close: "Close",
+    checkingWorkbench: "Checking workbench...",
+    noDataYet: "No data yet.",
+    info: "Info",
+    bindings: "Bindings",
+    depOk: "OK",
+    depMissing: "Missing",
+    noBindingsRepo: "No bindings found for this repo.",
+    noBindingSession: "No binding found for this session.",
+    repoNotDetected: "(not detected)",
+    unknown: "(unknown)",
+    metaRepo: (value) => `repo=${value}`,
+    metaScope: (value) => `scope=${value}`,
+    metaSession: (value) => `session=${value}`,
+    metaParent: (value) => `parent=${value}`,
+    metaChild: (value) => `child=${value}`,
+    metaBindings: (sessionCount, repoCount, allCount) =>
+      `bindings session=${sessionCount} repo=${repoCount} all=${allCount}`,
+    errorPrefix: "Error:",
+    snapshotUnavailable: "Snapshot is unavailable",
+  },
+  "zh-CN": {
+    workbench: "工作台",
+    showWorkbench: "显示工作台",
+    scopeRepoBadge: "仓库",
+    scopeSessionBadge: "会话",
+    updating: "更新中...",
+    toggleScope: "切换范围",
+    scopeButtonSession: "会话",
+    scopeButtonRepo: (count) => (count > 0 ? `仓库 (${count})` : "仓库"),
+    showDetails: "显示详情",
+    hideDetails: "隐藏详情",
+    refresh: "刷新",
+    collapse: "收起",
+    close: "关闭",
+    checkingWorkbench: "正在检查工作台...",
+    noDataYet: "暂无数据。",
+    info: "信息",
+    bindings: "绑定",
+    depOk: "正常",
+    depMissing: "缺失",
+    noBindingsRepo: "当前仓库未找到绑定。",
+    noBindingSession: "当前会话未找到绑定。",
+    repoNotDetected: "（未检测到）",
+    unknown: "（未知）",
+    metaRepo: (value) => `仓库=${value}`,
+    metaScope: (value) => `范围=${value}`,
+    metaSession: (value) => `会话=${value}`,
+    metaParent: (value) => `父会话=${value}`,
+    metaChild: (value) => `子会话=${value}`,
+    metaBindings: (sessionCount, repoCount, allCount) =>
+      `绑定 会话=${sessionCount} 仓库=${repoCount} 全部=${allCount}`,
+    errorPrefix: "错误：",
+    snapshotUnavailable: "快照不可用",
+  },
+}
+
+function detectLocale(value: string): LocaleCode {
+  const normalized = String(value || "").trim().toLowerCase()
+  if (normalized.startsWith("zh")) return "zh-CN"
+  return "en-US"
 }
 
 function asObject(value: JsonValue | undefined | null): Record<string, JsonValue> {
@@ -196,6 +310,9 @@ function prId(url?: string): string {
 }
 
 export function mount(el: HTMLElement, opts: StudioMountOptions) {
+  const locale = detectLocale(String(opts.context?.locale || opts.context?.lang || "en-US"))
+  const t = UI_I18N[locale]
+  const hostMenuMode = String(opts.context?.studioOverlayMode || "").trim() === "host-menu"
   const sessionId = String(opts.context?.sessionId || opts.context?.sessionID || "").trim()
   const parentSessionId = String(opts.context?.parentSessionId || opts.context?.parentSessionID || sessionId).trim()
   const childSessionId = String(opts.context?.childSessionId || opts.context?.childSessionID || "").trim()
@@ -204,7 +321,7 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
     sessionId,
     parentSessionId,
     childSessionId,
-    collapsed: true,
+    collapsed: !hostMenuMode,
     scope: "session",
     infoOpen: false,
     loading: false,
@@ -274,7 +391,7 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
         childSessionId: state.childSessionId,
       })
       const snap = parseSnapshot(raw)
-      if (!snap) throw new Error("Snapshot is unavailable")
+      if (!snap) throw new Error(t.snapshotUnavailable)
       if (seq !== refreshSeq) return
       state.snapshot = snap
       state.parentSessionId = String(snap.parentSessionId || state.parentSessionId || state.sessionId).trim()
@@ -300,6 +417,7 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
   }
 
   function toggleCollapsed() {
+    if (hostMenuMode) return
     state.collapsed = !state.collapsed
     if (state.collapsed) {
       state.infoOpen = false
@@ -331,8 +449,8 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
           type="button"
           data-wb-action="toggle"
           class="h-9 px-3 rounded-full shadow-md border border-border/50 bg-background/80 backdrop-blur hover:bg-background transition-all inline-flex items-center gap-2"
-          aria-label="Show workbench"
-          title="Show workbench"
+          aria-label="${htmlEscape(t.showWorkbench)}"
+          title="${htmlEscape(t.showWorkbench)}"
           ${state.busy ? "disabled" : ""}
         >
           ${iconSvg("wrench", "h-4 w-4 text-muted-foreground")}
@@ -345,8 +463,8 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
   function renderDeps(snap: Snapshot): string {
     const row = (name: string, ok: boolean, version: string) => {
       const badge = ok
-        ? '<span class="text-[10px] px-1 rounded bg-emerald-500/15 text-emerald-700">OK</span>'
-        : '<span class="text-[10px] px-1 rounded bg-rose-500/15 text-rose-700">Missing</span>'
+        ? `<span class="text-[10px] px-1 rounded bg-emerald-500/15 text-emerald-700">${htmlEscape(t.depOk)}</span>`
+        : `<span class="text-[10px] px-1 rounded bg-rose-500/15 text-rose-700">${htmlEscape(t.depMissing)}</span>`
       return `<div class="flex items-center gap-2 text-[11px]"><span class="font-medium text-foreground/90">${htmlEscape(
         name,
       )}</span>${badge}<span class="min-w-0 truncate text-[10px] text-muted-foreground" title="${htmlEscape(version)}">${htmlEscape(
@@ -358,12 +476,12 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
 
   function renderInfo(snap: Snapshot): string {
     const meta = [
-      snap.repo.commonDir ? `repo=${snap.repo.commonDir}` : "repo=(not detected)",
-      `scope=${snap.scope}`,
-      `session=${snap.sessionId || "(unknown)"}`,
-      snap.parentSessionId ? `parent=${snap.parentSessionId}` : "",
-      snap.childSessionId ? `child=${snap.childSessionId}` : "",
-      `bindings session=${snap.counts.session} repo=${snap.counts.repo} all=${snap.counts.all}`,
+      t.metaRepo(snap.repo.commonDir || t.repoNotDetected),
+      t.metaScope(snap.scope),
+      t.metaSession(snap.sessionId || t.unknown),
+      snap.parentSessionId ? t.metaParent(snap.parentSessionId) : "",
+      snap.childSessionId ? t.metaChild(snap.childSessionId) : "",
+      t.metaBindings(snap.counts.session, snap.counts.repo, snap.counts.all),
     ]
       .filter(Boolean)
       .map((line) => `<div class="text-[11px] text-muted-foreground">${htmlEscape(line)}</div>`)
@@ -374,8 +492,8 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
   function renderBindings(snap: Snapshot): string {
     if (!snap.bindings.length) {
       return snap.scope === "repo"
-        ? `<div class="px-2 py-2 text-center text-xs text-muted-foreground">No bindings found for this repo.</div>`
-        : `<div class="px-2 py-2 text-center text-xs text-muted-foreground">No binding found for this session.</div>`
+        ? `<div class="px-2 py-2 text-center text-xs text-muted-foreground">${htmlEscape(t.noBindingsRepo)}</div>`
+        : `<div class="px-2 py-2 text-center text-xs text-muted-foreground">${htmlEscape(t.noBindingSession)}</div>`
     }
 
     const rows = snap.bindings
@@ -415,27 +533,27 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
     const snap = state.snapshot
 
     const errorBlock = state.error
-      ? `<div class="rounded bg-destructive/10 px-2 py-1.5 text-xs text-destructive flex items-start gap-2"><span class="font-bold">Error:</span> ${htmlEscape(state.error)}</div>`
+      ? `<div class="rounded bg-destructive/10 px-2 py-1.5 text-xs text-destructive flex items-start gap-2"><span class="font-bold">${htmlEscape(t.errorPrefix)}</span> ${htmlEscape(state.error)}</div>`
       : ""
 
     const header = `
       <div class="flex items-center border-b border-border/30 bg-muted/20 gap-2 px-2 py-1">
         <div class="flex items-center gap-2 min-w-0 flex-1">
-          <span class="truncate text-[11px] font-semibold text-foreground/90 select-none cursor-default" title="Workbench">Workbench</span>
+          <span class="truncate text-[11px] font-semibold text-foreground/90 select-none cursor-default" title="${htmlEscape(t.workbench)}">${htmlEscape(t.workbench)}</span>
           <span class="text-[10px] px-1 rounded bg-muted text-muted-foreground">${htmlEscape(
-            state.scope === "repo" ? "repo" : "session",
+            state.scope === "repo" ? t.scopeRepoBadge : t.scopeSessionBadge,
           )}</span>
-          ${state.loading ? '<span class="animate-pulse text-[10px] text-muted-foreground">Updating...</span>' : ""}
+          ${state.loading ? `<span class="animate-pulse text-[10px] text-muted-foreground">${htmlEscape(t.updating)}</span>` : ""}
         </div>
         <div class="flex items-center gap-0.5">
           <button
             type="button"
             data-wb-action="scope"
             class="h-7 px-2 inline-flex items-center justify-center rounded border border-border/50 bg-background/50 hover:bg-background hover:border-border/70 transition-colors text-[10px] text-muted-foreground"
-            title="Toggle scope"
-            aria-label="Toggle scope"
+            title="${htmlEscape(t.toggleScope)}"
+            aria-label="${htmlEscape(t.toggleScope)}"
           >
-            ${htmlEscape(state.scope === "repo" ? "Session" : `Repo ${snap?.counts?.repo ? `(${snap.counts.repo})` : ""}`.trim())}
+            ${htmlEscape(state.scope === "repo" ? t.scopeButtonSession : t.scopeButtonRepo(snap?.counts?.repo ?? 0))}
           </button>
           <button
             type="button"
@@ -445,8 +563,8 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
                 ? "border-border/70 bg-muted/50 text-foreground shadow-inner"
                 : "border-transparent text-muted-foreground hover:bg-muted/40"
             }"
-            title="${state.infoOpen ? "Hide details" : "Show details"}"
-            aria-label="${state.infoOpen ? "Hide details" : "Show details"}"
+            title="${htmlEscape(state.infoOpen ? t.hideDetails : t.showDetails)}"
+            aria-label="${htmlEscape(state.infoOpen ? t.hideDetails : t.showDetails)}"
             aria-pressed="${state.infoOpen ? "true" : "false"}"
           >
             ${iconSvg("help", `h-3.5 w-3.5 ${state.infoOpen ? "text-foreground/90" : "text-muted-foreground/70"}`)}
@@ -455,33 +573,45 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
             type="button"
             data-wb-action="refresh"
             class="h-7 w-7 inline-flex items-center justify-center rounded hover:bg-muted/40"
-            title="Refresh"
-            aria-label="Refresh"
+            title="${htmlEscape(t.refresh)}"
+            aria-label="${htmlEscape(t.refresh)}"
             ${state.busy ? "disabled" : ""}
           >
             ${iconSvg("refresh", "h-3.5 w-3.5 text-muted-foreground/70")}
           </button>
-          <button
+          ${
+            hostMenuMode
+              ? `<button
+            type="button"
+            data-wb-action="close"
+            class="h-7 w-7 inline-flex items-center justify-center rounded hover:bg-muted/40"
+            title="${htmlEscape(t.close)}"
+            aria-label="${htmlEscape(t.close)}"
+          >
+            ${iconSvg("x", "h-3.5 w-3.5 text-muted-foreground/70")}
+          </button>`
+              : `<button
             type="button"
             data-wb-action="toggle"
             class="h-7 w-7 inline-flex items-center justify-center rounded hover:bg-muted/40"
-            title="Collapse"
-            aria-label="Collapse"
+            title="${htmlEscape(t.collapse)}"
+            aria-label="${htmlEscape(t.collapse)}"
           >
             ${iconSvg("hide", "h-3.5 w-3.5 text-muted-foreground/70")}
-          </button>
+          </button>`
+          }
         </div>
       </div>
     `
 
     const body = !snap
-      ? `<div class="py-2 text-center text-xs text-muted-foreground italic leading-relaxed">${state.loading ? "Checking workbench..." : "No data yet."}</div>`
+      ? `<div class="py-2 text-center text-xs text-muted-foreground italic leading-relaxed">${htmlEscape(state.loading ? t.checkingWorkbench : t.noDataYet)}</div>`
       : `
           <div class="flex flex-col gap-2">
             <div class="flex items-center justify-between gap-2">
               <div class="flex items-center gap-2 text-[11px] font-semibold text-foreground/85">
                 ${iconSvg(state.infoOpen ? "help" : "list", "h-4 w-4 text-muted-foreground/70")}
-                <span>${htmlEscape(state.infoOpen ? "Info" : "Bindings")}</span>
+                <span>${htmlEscape(state.infoOpen ? t.info : t.bindings)}</span>
               </div>
               <span class="text-[10px] text-muted-foreground truncate">${htmlEscape(snap.repo.commonDir || "")}</span>
             </div>
@@ -509,7 +639,7 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
       setReservePx(0)
       return
     }
-    const body = state.collapsed ? renderCollapsedButton() : renderExpandedPanel()
+    const body = hostMenuMode || !state.collapsed ? renderExpandedPanel() : renderCollapsedButton()
     el.innerHTML = `<div class="pointer-events-none w-full flex justify-end">${body}</div>`
   }
 
@@ -533,6 +663,11 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
     }
     if (action === "refresh") {
       scheduleRefresh(0)
+      return
+    }
+    if (action === "close") {
+      opts.close?.()
+      return
     }
   }
 
