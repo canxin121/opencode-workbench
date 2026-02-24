@@ -18,11 +18,10 @@ function run(request: unknown) {
 
 const resp1 = run({ action: "workbench.snapshot", payload: null, context: { sessionId: "studio", cwd: process.cwd() } })
 if (!resp1 || resp1.ok !== true) throw new Error(`snapshot failed: ${JSON.stringify(resp1)}`)
+if (typeof resp1.data?.sessionId !== "string") throw new Error("snapshot missing sessionId")
+if (typeof resp1.data?.parentSessionId !== "string") throw new Error("snapshot missing parentSessionId")
 
 const resp2 = run({ action: "events.poll", payload: { cursor: "" }, context: { sessionId: "studio", cwd: process.cwd() } })
 if (!resp2 || resp2.ok !== true) throw new Error(`events.poll failed: ${JSON.stringify(resp2)}`)
-
-const resp3 = run({ action: "config.get", payload: null, context: { sessionId: "studio", cwd: process.cwd() } })
-if (!resp3 || resp3.ok !== true) throw new Error(`config.get failed: ${JSON.stringify(resp3)}`)
 
 process.stdout.write("studio bridge selfcheck: ok\n")

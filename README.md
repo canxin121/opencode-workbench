@@ -1,10 +1,14 @@
 # opencode-workbench
 
-Create isolated per-branch sandboxes for parallel development with OpenCode.
+Lightweight bindings between git worktrees and OpenCode sessions for parallel development.
 
-This plugin is designed for workflows where you use `git worktree` / GitHub forks to develop in parallel,
-but you still want each OpenCode sub-session to operate in its own temporary copy (sandbox) to avoid
-editing the wrong branch directory.
+This plugin does **not** create sandboxes or sync files. Instead, it:
+
+- injects a prompt that guides the AI to use `git` and `gh` directly
+- records bindings (worktree dir, branch, session id, fork/upstream/PR metadata)
+- auto-routes built-in Task `task_id` in workbench supervisor/implementation sessions when unambiguous
+- provides a small Studio UI that shows your bindings (session-scoped by default)
+- enforces git-only directories for bind/open/task (non-git dirs are rejected with guidance)
 
 ## Install
 
@@ -30,9 +34,11 @@ Optionally pin a version:
 
 For local development, you can also load it via `file://` (point to a built JS file).
 
-## Tool
+## Tools
 
-The plugin exposes a single tool: `workbench`.
+The plugin exposes one tool:
+
+- `workbench`: manage bindings/session metadata, open pinned sessions, and run directory-aware task prompts
 
 Full help:
 
@@ -42,59 +48,57 @@ workbench { action: "help" }
 
 Use this tool when you need parallel work across branches/worktrees (git worktree, GitHub fork, multiple branches at once).
 
+Note: `bind`, `open`, and `task` require a real git repository/worktree. If git is not detected, workbench returns an error that tells the AI/user to initialize or create a repo first (for example `git init`).
+
 Actions:
 
 - `help`: show full usage help.
-- `create`: create a git worktree (optional), build a sandbox copy, and create a child session pinned to that sandbox.
-- `create` with `github=true`: also runs `gh` + local `git` remote wiring (ensure fork exists, add/repair fork+upstream remotes) in the same invocation.
-- `list`: list known sandboxes.
-- `info`: show sandbox metadata (paths, session id, PR url).
-- `doctor`: check git/gh/rsync/tar availability and repo wiring.
-- `preview`: show a dry-run sync plan (rsync-based).
-- `sync`: copy sandbox contents back to its recorded source worktree.
-- `publish`: sync + commit + push + PR (optional flags, defaults to push/PR when GitHub context exists).
-- `checkpoint`: create a copy of a sandbox as a new sandbox.
-- `reset`: rebuild sandbox contents from the recorded source worktree.
-- `rename`: rename a managed sandbox directory.
-- `gc`: garbage-collect old/orphan sandboxes (dry-run by default).
-- `cleanup`: remove sandbox and optionally its managed worktree.
+- `bind`: create/update a binding (defaults to current session)
+  - validates `upstream`/`fork` as `OWNER/REPO`
+  - validates `prUrl` as `https://<host>/<owner>/<repo>/pull/<number>`
+  - supports metadata clearing via `clear: "prUrl"` or `clear: "github"`
+- `open`: create/reuse a pinned child session for a binding
+- `task`: run a prompt in a routed workbench session (optionally by `dir` or `task_id`)
+- `list`: list bindings (defaults to current session; use `scope: "repo"` for repo)
+- `info`: show a binding (defaults to current session)
+- `remove`: remove a binding (defaults to current session)
+- `doctor`: check tooling and repo identity
+
+Name-only operations (`open/info/remove` with `name` but no `dir`) can resolve from session scope first, then repo/global scope when the name is unique.
+
+Scopes:
+
+- Default is session-scoped (minimal/no noise).
+- Session scope includes current session and direct child-session bindings (supervisor-friendly).
+- Use `scope: "repo"` to list bindings for the current git repo (if you're not inside the repo, pass `dir: "path/to/repo"`).
+- Use `scope: "all"` to list bindings across all repos.
+
+Session targeting params (optional):
+
+- `parentSessionId`: override supervisor session id (default: current session id)
+- `sessionId`: explicit child/target session id for list/info/task lookups
+- `strict`: for `info`, fail on ambiguity instead of auto-selecting the latest binding
+
+Task isolation:
+
+- Concurrent `workbench { action: "task" }` calls targeting the same session are serialized to avoid response cross-talk.
+- Use different `dir`/`task_id` values when you want true parallel execution.
+- Task output includes `task_queue_ms`, `task_run_ms`, and `task_queued` for queue observability.
+
+Suggested governance workflow:
+
+- Child sessions run their own `git commit`, `git push`, and `gh pr merge`.
+- Supervisor session coordinates and confirms approval with the user before those steps.
+- User may preapprove those delivery actions; supervisor should restate the approval in the prompt flow.
 
 ## Configuration
 
-`opencode-workbench` reads a dedicated project config file (not `opencode.json`) from:
+No project config file is required.
 
-- `.opencode/workbench.toml`
+Bindings are stored under your state directory:
 
-This file lives in the same folder as `.opencode/opencode.json*`.
-All keys are optional; when omitted, safe defaults apply.
-
-Example `.opencode/workbench.toml`:
-
-```toml
-# Defaults for the workbench tool
-copyMode = "worktree"
-copyExcludeMode = "append"
-copyExclude = ["node_modules", "dist", "build"]
-
-# GitHub wiring
-github = true
-ghHost = "github.com"
-upstreamRemote = "upstream"
-forkRemote = "fork"
-protocol = "auto"
-fetch = true
-
-# PR defaults
-pr = true
-draft = true
-prLabels = ["workbench"]
-prReviewers = ["myorg/team"]
-
-# Publish defaults
-stage = "tracked"
-commitBodyAuto = true
-lockTimeout = 3600
-```
+- `$XDG_STATE_HOME/opencode/workbench/entries/`
+- fallback: `~/.local/state/opencode/workbench/entries/`
 
 ## Publishing (npm)
 
@@ -104,81 +108,54 @@ Suggested checklist before `npm publish`:
 - Run `bun run publish:check`
 - Ensure `npm whoami` works and publish with the right access (scoped packages usually need `--access public`)
 
-## One-command fork + sandbox
+## Example
 
-Example: create a sandbox for a feature branch, and ensure your GitHub fork remotes exist.
+Keep worktrees inside the repo directory (recommended):
+
+- Add `.workbench/` to the repo `.gitignore`
+- Create worktrees under `.workbench/` (example): `git worktree add .workbench/feature-x feature/x`
+
+Bind a worktree directory and open a pinned OpenCode session:
 
 ```text
-workbench { action: "create", github: true, branch: "feature/my-thing" }
+workbench { action: "open", dir: ".workbench/feature-x", name: "feature-x" }
 ```
 
-If you want the sandbox to include local edits and untracked files (instead of only committed tracked files), use `copyMode: "worktree"`:
+Suggested split:
+
+- Keep the top-level session focused on orchestration (`git`, `gh`, `workbench`) when running parallel branches.
+- Run implementation prompts with `workbench { action: "task", ... }` so routing stays worktree-aware.
 
 ```text
-workbench { action: "create", github: true, branch: "feature/my-thing", copyMode: "worktree" }
+workbench { action: "task", dir: ".workbench/feature-x", prompt: "Implement feature", agent: "general" }
 ```
 
-By default, `copyMode: "worktree"` excludes large/common build artifacts (like `node_modules`).
-If you want to fully control the exclude list, set `copyExcludeMode: "replace"`.
-
-If you also want to push the branch to your fork automatically:
+If you need explicit parent+child visibility in supervisor workflows:
 
 ```text
-workbench { action: "create", github: true, branch: "feature/my-thing", push: true }
+workbench { action: "list", scope: "session", parentSessionId: "ses_parent", sessionId: "ses_child" }
 ```
 
-If the branch does not exist locally yet, `create` will (by default) create it from the upstream default branch.
-You can override this with `base`:
+In workbench supervisor/implementation sessions, built-in `task` with `directory` is blocked; use `workbench { action: "task", ... }` instead.
+
+If routing is ambiguous, get session id and pass `task_id` explicitly:
 
 ```text
-workbench { action: "create", github: true, branch: "feature/my-thing", base: "dev" }
+workbench { action: "info" }
+workbench { action: "task", task_id: "ses_xxx", prompt: "Implement feature" }
 ```
 
-## One-command PR
-
-Create (or reuse) an upstream PR for this fork branch in the same invocation:
+Record PR metadata so the Studio UI can show it:
 
 ```text
-workbench { action: "create", github: true, branch: "feature/my-thing", pr: true }
+workbench { action: "bind", name: "my-thing", upstream: "org/repo", fork: "me/repo", prUrl: "https://github.com/org/repo/pull/123" }
 ```
 
-## One-command publish
-
-After you finished editing inside the sandbox, publish the changes back to the source worktree:
+Clear stale metadata explicitly when needed:
 
 ```text
-workbench { action: "publish", sandbox: "<sandbox-name>" }
-```
-
-This will:
-
-- sync sandbox -> worktree
-- require a clean target worktree (unless `allowDirty: true`)
-- `git add -A` + `git commit`
-- `git push -u fork <branch>` and create/update PR when GitHub context exists
-
-You can change staging behavior:
-
-```text
-workbench { action: "publish", sandbox: "<sandbox-name>", stage: "tracked" }
-```
-
-And generate a commit body with a file list:
-
-```text
-workbench { action: "publish", sandbox: "<sandbox-name>", commitBodyAuto: true }
-```
-
-Preview what would sync (no files are changed):
-
-```text
-workbench { action: "preview", sandbox: "<sandbox-name>" }
-```
-
-Propagate deletions from sandbox to target (dangerous; requires a clean target by default):
-
-```text
-workbench { action: "publish", sandbox: "<sandbox-name>", delete: true }
+workbench { action: "bind", name: "my-thing", clear: "prUrl" }
+workbench { action: "bind", name: "my-thing", clear: "github" }
 ```
 
 ## Housekeeping
@@ -189,65 +166,14 @@ Doctor (non-destructive):
 workbench { action: "doctor" }
 ```
 
-Checkpoint a sandbox (create a copy):
+Remove a binding:
 
 ```text
-workbench { action: "checkpoint", sandbox: "<sandbox-name>", name: "<new-name>" }
-```
-
-Reset a sandbox back to the source worktree (by default makes a checkpoint backup first):
-
-```text
-workbench { action: "reset", sandbox: "<sandbox-name>" }
-```
-
-Rename a sandbox (if it has a session, use `force: true`). Note: OpenCode session directory is not updated; continue with `--dir`:
-
-```text
-workbench { action: "rename", sandbox: "<sandbox-name>", renameTo: "<new-name>", force: true }
-```
-
-Garbage collect (dry-run):
-
-```text
-workbench { action: "gc", gcDays: 30 }
-```
-
-Apply deletions:
-
-```text
-workbench { action: "gc", gcDays: 30, gcApply: true }
-```
-
-Draft PR with custom title/body:
-
-```text
-workbench {
-  action: "create",
-  github: true,
-  branch: "feature/my-thing",
-  pr: true,
-  draft: true,
-  prTitle: "feat: my thing",
-  prBody: "What changed and why"
-}
-```
-
-Add labels/reviewers/assignees in the same invocation:
-
-```text
-workbench {
-  action: "create",
-  github: true,
-  branch: "feature/my-thing",
-  pr: true,
-  prLabels: ["workbench", "enhancement"],
-  prReviewers: ["myorg/team"],
-  prAssignees: ["@me"]
-}
+workbench { action: "remove", name: "my-thing" }
 ```
 
 ## Notes
 
-- Sandboxes are stored under OpenCode's state directory (see `/path` API) in `workbench/`.
-- Sandbox content is created via `git archive` (tracked files only) to avoid copying `.git/` and bulky artifacts.
+- `workbench` intentionally keeps file operations out of scope (metadata + binding only).
+- Use `workbench { action: "task", ... }` for directory-aware implementation prompts in bound worktrees.
+- Use `git worktree`, `git switch`, `git push`, and `gh pr create/edit` directly for git/GitHub workflows.

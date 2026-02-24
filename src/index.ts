@@ -1,14 +1,15 @@
 import { tool, type Plugin } from "@opencode-ai/plugin"
-import { mkdir, readdir, rm, rename, stat, open } from "node:fs/promises"
+import { mkdir, readdir, rm, stat } from "node:fs/promises"
 import path from "node:path"
 import os from "node:os"
-import { randomBytes, createHash } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 
-const META = ".opencode-workbench.json"
+const INJECTION = `Use workbench when you need concurrent work across branches/worktrees.
 
-const DEFAULT_EXCLUDE = [".git", META, "node_modules", "dist", "build", ".next", ".turbo", "coverage", ".cache", "target", ".DS_Store"]
+- It binds a worktree directory to a pinned OpenCode session and stores metadata for Studio.
+- Typical flow: workbench { action: "open", dir: ".workbench/<name>", name: "<name>" } then workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.
+- task_id is optional when you want explicit routing.
 
-const INJECTION = `Parallel branch/worktree tasks: use workbench to create an isolated sandbox + pinned session (avoid editing the wrong directory).
 Help: workbench { action: "help" }`
 
 const DESCRIPTION = INJECTION
@@ -16,161 +17,96 @@ const DESCRIPTION = INJECTION
 const HELP = `opencode-workbench (tool: workbench)
 
 Purpose
-- Create isolated per-branch sandboxes (temporary code copies) for parallel work.
-- Create child sessions pinned to the sandbox directory to avoid editing the wrong branch/worktree.
-- Sync/publish changes back to the recorded source worktree with safety checks + locking.
+- Lightweight registry for binding git worktrees to OpenCode sessions.
+- This tool does NOT create worktrees, remotes, or PRs. Use git + gh directly.
+- Requires a git repository/worktree; non-git directories are rejected.
+- Records metadata (worktree path, branch, fork, PR URL) so OpenCode Studio UI can display it.
+- Includes a task action for directory-aware subagent execution in bound worktrees.
 
-When to use
-- If the user requests parallel work across branches/worktrees (git worktree, forks, multiple branches at once), use this tool.
-
-Get help
-- Run: workbench { action: "help" }
-
-Project configuration (recommended)
-- File: .opencode/workbench.toml  (same folder as .opencode/opencode.json*)
-- Precedence: tool args > workbench.toml > safe defaults
-- Diagnose config + tooling: workbench { action: "doctor" }
-
-Common workflows
-
-1) Create a sandbox + pinned session
-  workbench { action: "create" }
-  workbench { action: "create", branch: "feature/my-thing" }
-
-2) GitHub fork + remotes wiring (single invocation)
-  workbench { action: "create", github: true, branch: "feature/my-thing" }
-
-3) Include local edits/untracked files in the sandbox
-  workbench { action: "create", copyMode: "worktree" }
-
-4) Preview what would sync (dry-run; requires rsync)
-  workbench { action: "preview", sandbox: "<name>" }
-  workbench { action: "preview", sandbox: "<name>", delete: true }
-
-5) Sync sandbox -> worktree
-  workbench { action: "sync", sandbox: "<name>" }
-
-6) Publish (sync + commit + optional push/PR)
-  workbench { action: "publish", sandbox: "<name>" }
+Common workflow
+1) Ensure worktrees stay inside the repo directory:
+   Add .workbench/ to the repo's .gitignore
+2) Create a git worktree under .workbench/ (example):
+   git worktree add .workbench/feature-x feature/x
+3) Bind + open a pinned session:
+   workbench { action: "open", dir: ".workbench/feature-x", name: "feature-x" }
+4) Use workbench task when you want implementation work routed to a specific worktree session.
+   workbench { action: "task", dir: ".workbench/feature-x", prompt: "Implement feature", agent: "general" }
+   (task_id auto-routes when possible)
+5) Update GitHub metadata (optional):
+   workbench { action: "bind", prUrl: "https://..." }
 
 Actions
 - help: show this help text
-- list: list known sandboxes
-- info: show sandbox metadata (paths/session/pr/publish info)
-- doctor: check git/gh/rsync/tar + repo wiring + config status
-- create: (optionally) make a managed git worktree, create sandbox, create pinned child session
-- open: create a pinned child session for an existing sandbox
-- preview: rsync dry-run from sandbox -> targetWorktree
-- sync: copy sandbox -> targetWorktree (default: no deletions)
-- publish: sync -> commit -> push/pr (optional) with safety checks
-- checkpoint: copy an existing sandbox into a new sandbox
-- reset: rebuild sandbox from sourceWorktree (default: checkpoint backup first)
-- rename: rename a managed sandbox directory (use force=true if it has a recorded session)
-- gc: garbage-collect old/orphan sandboxes (dry-run unless gcApply=true)
-- cleanup: remove sandbox and optionally the managed worktree
+- doctor: show tooling + detected repo identity
+- list: list bindings (default: current session)
+- info: show a binding (default: current session)
+- bind: create/update a binding (default: current session)
+  - validates upstream/fork as OWNER/REPO and prUrl as .../pull/<number>
+  - supports clear="prUrl" or clear="github" (comma/space-separated)
+- open: create/reuse a pinned child session for a binding
+- task: run a prompt in a routed/pinned workbench session
+  (concurrent calls to the same target session are serialized to avoid response cross-talk)
+  (output includes task_queue_ms/task_run_ms/task_queued)
+- remove: delete a binding (default: current session)
 
-High-impact options
+Scopes (for list)
+- scope="session" (default): bindings attached to this session and its direct children
+- scope="repo": bindings for the current git repo
+- scope="all": bindings across all repos
 
-Copying
-- copyMode: "archive" | "worktree"
-  - archive: git archive (tracked+committed files only)
-  - worktree: filesystem snapshot (includes local edits/untracked; uses rsync if available)
-- copyExcludeMode: "append" | "replace"
-  - append: DEFAULT_EXCLUDE + copyExclude
-  - replace: only copyExclude
-- copyExclude: string[] (patterns are passed to rsync --exclude)
+Session targeting
+- parentSessionId: optional parent/supervisor session id (defaults to current session id)
+- sessionId: optional child/target session id; useful when parent and child both need visibility
+- strict: for info, fail on ambiguous matches instead of choosing the latest
 
-Sync/publish safety
-- delete: when true, propagate deletions from sandbox to target (requires rsync)
-- allowDirty: when false (default), target worktree must be clean before delete/publish
-- lockTimeout: lock TTL seconds for sync/publish/reset; force=true breaks stale locks
+Storage
+- Registry files live under: $XDG_STATE_HOME/opencode/workbench/entries/
+  (fallback: ~/.local/state/opencode/workbench/entries/)`
 
-Publish controls
-- commit: set false to sync only (no commit)
-- stage: "all" (git add -A) | "tracked" (git add -u)
-- commitBodyAuto: when true and commitBody is empty, generate a file list body
-- noVerify: pass --no-verify to git commit
-- sign: keep commit signing enabled (default false -> use --no-gpg-sign)
+const SUPERVISOR_HINT = `Workbench mode: this is a supervisor session.
+- Prefer orchestration work here (git/gh/workbench).
+- For implementation prompts, use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.
+- Coordinate and approve child git/gh delivery steps based on user intent.
+- Keep direct edits here minimal; .gitignore updates for .workbench setup are allowed.`
 
-GitHub / PR
-- github: run gh wiring (fork + remotes + optional fetch)
-- push: push branch to fork
-- pr: create/reuse PR on upstream; also updates labels/reviewers/assignees when PR exists
+const IMPLEMENTATION_HINT = `Workbench mode: this session is pinned to a workbench worktree.
+- Keep file edits inside this worktree only.
+- Prefer running implementation prompts via workbench { action: "task", prompt: "..." } in this session scope.
+- Ask supervisor for approval before git commit/push/gh pr merge.
+- Handle your own git commit/push/pr merge after approval; supervisor coordinates and user approves policy.`
 
-Examples: .opencode/workbench.toml
-
-copyMode = "worktree"
-copyExcludeMode = "append"
-copyExclude = ["node_modules", "dist", "build"]
-
-github = true
-ghHost = "github.com"
-upstreamRemote = "upstream"
-forkRemote = "fork"
-protocol = "auto"
-fetch = true
-
-pr = true
-draft = true
-prLabels = ["workbench"]
-
-stage = "tracked"
-commitBodyAuto = true
-lockTimeout = 3600
-`
-
-type Meta = {
+type Entry = {
   version: 1
   id: string
   name: string
-  branch?: string
-  copy?: {
-    mode: "archive" | "worktree"
-    excludeMode?: "append" | "replace"
-    exclude: string[]
+  worktree: {
+    path: string
+    branch?: string
+  }
+  repo?: {
+    commonDir?: string
+    origin?: string
+    root?: string
   }
   github?: {
-    host: string
+    host?: string
     upstream?: string
     fork?: string
-    protocol?: "ssh" | "https"
-    defaultBranch?: string
-    base?: string
-    remotes?: {
-      upstream: string
-      fork: string
-    }
-    pr?: {
-      url: string
-    }
-  }
-  project: {
-    id: string
-    worktree: string
-  }
-  source: {
-    worktree: string
-  }
-  sandbox: {
-    path: string
+    prUrl?: string
   }
   session?: {
     id: string
     parent?: string
-  }
-  publish?: {
-    time: number
-    commit?: string
-    pushed?: {
-      remote: string
-      branch: string
-    }
+    title?: string
   }
   time: {
     created: number
     updated: number
   }
 }
+
+type Scope = "session" | "repo" | "all"
 
 const unwrap = <T>(response: unknown): T => {
   if (response && typeof response === "object" && "data" in response) {
@@ -180,7 +116,19 @@ const unwrap = <T>(response: unknown): T => {
   return response as T
 }
 
-const uniq = (list: string[]) => Array.from(new Set(list.map((x) => x.trim()).filter(Boolean)))
+function taskText(response: unknown) {
+  if (!response || typeof response !== "object") return ""
+  const parts = (response as { parts?: unknown }).parts
+  if (!Array.isArray(parts)) return ""
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i]
+    if (!part || typeof part !== "object") continue
+    const type = (part as Record<string, unknown>).type
+    const text = (part as Record<string, unknown>).text
+    if (type === "text" && typeof text === "string") return text
+  }
+  return ""
+}
 
 const clean = (input: string) =>
   input
@@ -192,580 +140,242 @@ const clean = (input: string) =>
     .replace(/[-.]+$/, "")
     .slice(0, 120)
 
-const hash = (input: string) => createHash("sha1").update(input).digest("hex").slice(0, 8)
+const hash = (input: string) => createHash("sha1").update(input).digest("hex").slice(0, 10)
 
-const key = (input: string) => clean(input) || "x"
+const key = (input: string) => (clean(input) || "x").toLowerCase()
 
-const isInside = (root: string, candidate: string) => {
-  const rel = path.relative(root, candidate)
+function fileArg(args: unknown) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return ""
+  const value = (args as Record<string, unknown>).filePath
+  if (typeof value !== "string") return ""
+  return value.trim()
+}
+
+function directoryArg(args: unknown) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return ""
+  const value = (args as Record<string, unknown>).directory
+  if (typeof value !== "string") return ""
+  return value.trim()
+}
+
+function pathArg(args: unknown) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return ""
+  const value = (args as Record<string, unknown>).path
+  if (typeof value !== "string") return ""
+  return value.trim()
+}
+
+function workdirArg(args: unknown) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return ""
+  const value = (args as Record<string, unknown>).workdir
+  if (typeof value !== "string") return ""
+  return value.trim()
+}
+
+function isGitignore(filepath: string) {
+  const value = filepath.trim()
+  if (!value) return false
+  if (value === ".gitignore") return true
+  const normalized = value.replaceAll("\\", "/")
+  return normalized.endsWith("/.gitignore")
+}
+
+function within(base: string, target: string) {
+  const root = path.resolve(base)
+  const file = path.resolve(target)
+  const rel = path.relative(root, file)
   if (!rel) return true
-  if (rel.startsWith(".." + path.sep) || rel === "..") return false
+  if (rel.startsWith("..")) return false
   return !path.isAbsolute(rel)
 }
 
-const readMeta = async (dir: string) => {
-  const file = Bun.file(path.join(dir, META))
-  if (!(await file.exists())) return null
-  const raw = await file.text().catch(() => "")
-  if (!raw.trim()) return null
-  const data = JSON.parse(raw) as Meta
-  if (!data || typeof data !== "object") return null
-  if (data.version !== 1) return null
-  if (!data.sandbox?.path) return null
-  return data
+function resolvePath(base: string, raw: string) {
+  const value = raw.trim()
+  if (!value) return ""
+  if (path.isAbsolute(value)) return path.resolve(value)
+  return path.resolve(base, value)
 }
 
-const writeMeta = async (dir: string, meta: Meta) => {
-  const next: Meta = {
-    ...meta,
-    time: {
-      ...meta.time,
-      updated: Date.now(),
-    },
+function normalizeScope(raw: unknown, all?: boolean): Scope {
+  if (all === true) return "all"
+  const value = typeof raw === "string" ? raw.trim() : ""
+  if (value === "session" || value === "repo" || value === "all") return value
+  return "session"
+}
+
+function sessionArg(value: unknown) {
+  if (typeof value !== "string") return ""
+  return value.trim()
+}
+
+function clearSetArg(value: unknown) {
+  const tokens: string[] = []
+  if (typeof value === "string") tokens.push(value)
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item !== "string") continue
+      tokens.push(item)
+    }
   }
-  await Bun.write(path.join(dir, META), JSON.stringify(next, null, 2) + "\n")
+  const out = new Set<string>()
+  for (const raw of tokens) {
+    const parts = raw
+      .split(/[\s,]+/)
+      .map((x) => x.trim().toLowerCase())
+      .filter(Boolean)
+    for (const key of parts) out.add(key)
+  }
+  return out
+}
+
+function hasClear(clearSet: Set<string>, name: string) {
+  const keyName = name.trim().toLowerCase()
+  if (!keyName) return false
+  if (clearSet.has("all")) return true
+  if (clearSet.has(keyName)) return true
+  if (keyName === "ghhost" && clearSet.has("host")) return true
+  if (keyName === "prurl" && clearSet.has("pr")) return true
+  return false
+}
+
+function normalizeRepoRef(field: "upstream" | "fork", value: string) {
+  const next = value.trim()
+  if (!next) return ""
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(next)) {
+    throw new Error(`workbench: ${field} must match OWNER/REPO (got ${JSON.stringify(value)})`)
+  }
   return next
 }
 
-async function roots(ctx: any) {
-  const info = await ctx.client.path.get({ query: { directory: ctx.directory } }).catch(() => null)
-  const data = info ? unwrap<{ state?: string }>(info) : null
-  const state = typeof data?.state === "string" && data.state.trim() ? data.state : path.join(os.tmpdir(), "opencode")
-  const base = path.join(state, "workbench")
-  return {
-    base,
-    sandboxes: path.join(base, "sandboxes"),
-    worktrees: path.join(base, "worktrees"),
-    tmp: path.join(base, "tmp"),
-    locks: path.join(base, "locks"),
-  }
-}
+function normalizePrUrl(value: string) {
+  const input = value.trim()
+  if (!input) return ""
 
-const CONFIG_FILE = "workbench.toml"
-
-type Config = {
-  base?: string
-  copyMode?: "archive" | "worktree"
-  copyExclude?: string[]
-  copyExcludeMode?: "append" | "replace"
-  github?: boolean
-  ghHost?: string
-  repo?: string
-  fork?: string
-  forkRemote?: string
-  upstreamRemote?: string
-  protocol?: "auto" | "ssh" | "https"
-  fetch?: boolean
-  push?: boolean
-  pr?: boolean
-  draft?: boolean
-  prBase?: string
-  prTitle?: string
-  prBody?: string
-  prLabels?: string[]
-  prReviewers?: string[]
-  prAssignees?: string[]
-  prProjects?: string[]
-  prMilestone?: string
-  prNoMaintainerEdit?: boolean
-  delete?: boolean
-  previewLines?: number
-  commit?: boolean
-  commitMessage?: string
-  commitBody?: string
-  commitBodyAuto?: boolean
-  stage?: "all" | "tracked"
-  noVerify?: boolean
-  sign?: boolean
-  allowDirty?: boolean
-  cleanupSandbox?: boolean
-  resetBackup?: boolean
-  resetDelete?: boolean
-  gcDays?: number
-  gcKeepWithSession?: boolean
-  lockTimeout?: number
-}
-
-type LoadedConfig = {
-  path: string
-  status: "missing" | "loaded" | "invalid"
-  config: Config
-}
-
-function getBase(ctx: any) {
-  const root = typeof ctx.worktree === "string" && ctx.worktree.trim() && ctx.worktree !== "/" ? ctx.worktree : ctx.directory
-  return path.resolve(root)
-}
-
-async function loadConfig(base: string): Promise<LoadedConfig> {
-  const file = path.join(base, ".opencode", CONFIG_FILE)
-  const src = Bun.file(file)
-  if (!(await src.exists())) {
-    return { path: file, status: "missing", config: {} }
+  let url: URL
+  try {
+    url = new URL(input)
+  } catch {
+    throw new Error(`workbench: prUrl must be a full URL (got ${JSON.stringify(value)})`)
   }
 
-  const raw = await src.text().catch(() => "")
-  if (!raw.trim()) {
-    return { path: file, status: "invalid", config: {} }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error(`workbench: prUrl must use http or https (got ${JSON.stringify(value)})`)
   }
 
-  const obj = (() => {
-    try {
-      const parsed = Bun.TOML.parse(raw)
-      if (!parsed || typeof parsed !== "object") return null
-      return parsed as Record<string, unknown>
-    } catch {
-      return null
-    }
-  })()
-  if (!obj) return { path: file, status: "invalid", config: {} }
-
-  const data = (() => {
-    const scoped = obj.workbench
-    if (scoped && typeof scoped === "object") return scoped as Record<string, unknown>
-    return obj
-  })()
-
-  const one = <T extends string>(value: unknown, allowed: readonly T[]) =>
-    typeof value === "string" && allowed.includes(value as T) ? (value as T) : undefined
-  const str = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim() : undefined)
-  const bool = (value: unknown) => (typeof value === "boolean" ? value : undefined)
-  const num = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : undefined)
-  const list = (value: unknown) =>
-    Array.isArray(value)
-      ? value
-          .filter((x): x is string => typeof x === "string")
-          .map((x) => x.trim())
-          .filter(Boolean)
-      : undefined
-
-  const config: Config = {
-    base: str(data.base),
-    copyMode: one(data.copyMode, ["archive", "worktree"]),
-    copyExclude: list(data.copyExclude),
-    copyExcludeMode: one(data.copyExcludeMode, ["append", "replace"]),
-    github: bool(data.github),
-    ghHost: str(data.ghHost),
-    repo: str(data.repo),
-    fork: str(data.fork),
-    forkRemote: str(data.forkRemote),
-    upstreamRemote: str(data.upstreamRemote),
-    protocol: one(data.protocol, ["auto", "ssh", "https"]),
-    fetch: bool(data.fetch),
-    push: bool(data.push),
-    pr: bool(data.pr),
-    draft: bool(data.draft),
-    prBase: str(data.prBase),
-    prTitle: str(data.prTitle),
-    prBody: str(data.prBody),
-    prLabels: list(data.prLabels),
-    prReviewers: list(data.prReviewers),
-    prAssignees: list(data.prAssignees),
-    prProjects: list(data.prProjects),
-    prMilestone: str(data.prMilestone),
-    prNoMaintainerEdit: bool(data.prNoMaintainerEdit),
-    delete: bool(data.delete),
-    previewLines: num(data.previewLines),
-    commit: bool(data.commit),
-    commitMessage: str(data.commitMessage),
-    commitBody: str(data.commitBody),
-    commitBodyAuto: bool(data.commitBodyAuto),
-    stage: one(data.stage, ["all", "tracked"]),
-    noVerify: bool(data.noVerify),
-    sign: bool(data.sign),
-    allowDirty: bool(data.allowDirty),
-    cleanupSandbox: bool(data.cleanupSandbox),
-    resetBackup: bool(data.resetBackup),
-    resetDelete: bool(data.resetDelete),
-    gcDays: num(data.gcDays),
-    gcKeepWithSession: bool(data.gcKeepWithSession),
-    lockTimeout: num(data.lockTimeout),
+  const parts = url.pathname.split("/").filter(Boolean)
+  if (parts.length < 4 || parts[2] !== "pull" || !/^\d+$/.test(parts[3])) {
+    throw new Error(
+      `workbench: prUrl must look like https://<host>/<owner>/<repo>/pull/<number> (got ${JSON.stringify(value)})`,
+    )
   }
 
-  return {
-    path: file,
-    status: "loaded",
-    config,
-  }
+  return `${url.protocol}//${url.host}/${parts[0]}/${parts[1]}/pull/${parts[3]}`
 }
 
-async function ensureGit(ctx: any) {
-  const root = (ctx.worktree ?? "").trim()
-  if (!root || root === "/") throw new Error("workbench: requires a git worktree (ctx.worktree not set)")
-
-  const out = await ctx.$`git -C ${root} rev-parse --is-inside-work-tree`.nothrow().quiet()
-  if (out.exitCode !== 0) throw new Error("workbench: current directory is not inside a git repository")
-  return root
-}
-
-async function ensureGh(ctx: any, host: string, root: string) {
-  const ok = await ctx.$.cwd(root)`gh --version`.env({ GH_HOST: host }).nothrow().quiet()
-  if (ok.exitCode !== 0) {
-    throw new Error("workbench: gh not found on PATH")
-  }
-
-  const auth = await ctx.$.cwd(root)`gh auth status -h ${host}`.env({ GH_HOST: host }).nothrow().quiet()
-  if (auth.exitCode !== 0) {
-    throw new Error(`workbench: gh is not authenticated for ${host} (run: gh auth login)`) 
-  }
-}
-
-type GhRepo = {
-  nameWithOwner: string
-  isFork?: boolean
-  parent?: {
-    nameWithOwner?: string
-  }
-  sshUrl?: string
-}
-
-function httpsClone(host: string, repo: string) {
-  return `https://${host}/${repo}.git`
-}
-
-function sshClone(host: string, sshUrl: string | undefined, repo: string) {
-  if (sshUrl && sshUrl.trim()) return sshUrl.trim()
-  return `git@${host}:${repo}.git`
-}
-
-async function ghDefaultBranch(ctx: any, root: string, host: string, repo: string) {
-  const res = await ctx.$
-    .cwd(root)`gh api repos/${repo} --hostname ${host} --jq .default_branch`
-    .env({ GH_HOST: host })
-    .nothrow()
-    .quiet()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: failed to resolve default branch for ${repo}: ${res.stderr.toString() || res.stdout.toString()}`)
-  }
-  const branch = res.text().trim()
-  if (!branch) throw new Error(`workbench: failed to resolve default branch for ${repo}`)
-  return branch
-}
-
-async function gitRemoteHead(ctx: any, root: string, remote: string) {
-  const res = await ctx.$`git -C ${root} symbolic-ref --quiet refs/remotes/${remote}/HEAD`.nothrow().quiet()
-  if (res.exitCode !== 0) return ""
-  const ref = res.text().trim()
-  const parts = ref.split("/")
-  return parts[parts.length - 1] ?? ""
-}
-
-async function gitHas(ctx: any, root: string, ref: string) {
-  const res = await ctx.$`git -C ${root} show-ref --verify --quiet ${ref}`.nothrow().quiet()
-  return res.exitCode === 0
-}
-
-function repoArg(host: string, nameWithOwner: string) {
-  if (!nameWithOwner) return ""
-  if (host && host !== "github.com") return `${host}/${nameWithOwner}`
-  return nameWithOwner
-}
-
-async function prUrl(ctx: any, root: string, host: string, upstream: string, head: string) {
-  const args = [
-    "pr",
-    "list",
-    "-R",
-    repoArg(host, upstream),
-    "--head",
-    head,
-    "--state",
-    "open",
-    "--json",
-    "url",
-  ]
-  const list = await ghJson(ctx, root, host, args).catch(() => null)
-  if (!Array.isArray(list) || !list.length) return ""
-  const url = (list[0] as any)?.url
-  return typeof url === "string" ? url.trim() : ""
-}
-
-async function prCreate(ctx: any, root: string, host: string, upstream: string, input: {
-  head: string
-  base: string
-  title: string
-  body: string
-  draft: boolean
-  labels?: string[]
-  reviewers?: string[]
-  assignees?: string[]
-  projects?: string[]
-  milestone?: string
-  noMaintainerEdit?: boolean
-}) {
-  const labels = (input.labels ?? []).map((x) => x.trim()).filter(Boolean)
-  const reviewers = (input.reviewers ?? []).map((x) => x.trim()).filter(Boolean)
-  const assignees = (input.assignees ?? []).map((x) => x.trim()).filter(Boolean)
-  const projects = (input.projects ?? []).map((x) => x.trim()).filter(Boolean)
-  const milestone = (input.milestone ?? "").trim()
-  const args = [
-    "pr",
-    "create",
-    "-R",
-    repoArg(host, upstream),
-    "--head",
-    input.head,
-    "--base",
-    input.base,
-    "--title",
-    input.title,
-    "--body",
-    input.body,
-    ...(labels.length ? ["--label", labels.join(",")] : []),
-    ...(reviewers.length ? ["--reviewer", reviewers.join(",")] : []),
-    ...(assignees.length ? ["--assignee", assignees.join(",")] : []),
-    ...(projects.length ? ["--project", projects.join(",")] : []),
-    ...(milestone ? ["--milestone", milestone] : []),
-    ...(input.noMaintainerEdit ? ["--no-maintainer-edit"] : []),
-    ...(input.draft ? ["--draft"] : []),
-  ]
-  const res = await ctx.$.cwd(root)`gh ${args}`.env({ GH_HOST: host }).nothrow().quiet()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: gh pr create failed: ${res.stderr.toString() || res.stdout.toString()}`)
-  }
-  const text = res.text().trim()
-  const match = text.match(/https?:\/\/\S+/)
-  return match?.[0] ?? ""
-}
-
-async function prEdit(ctx: any, root: string, host: string, upstream: string, pr: string, input: {
-  base?: string
-  title?: string
-  body?: string
-  labels?: string[]
-  reviewers?: string[]
-  assignees?: string[]
-  projects?: string[]
-  milestone?: string
-}) {
-  const labels = (input.labels ?? []).map((x) => x.trim()).filter(Boolean)
-  const reviewers = (input.reviewers ?? []).map((x) => x.trim()).filter(Boolean)
-  const assignees = (input.assignees ?? []).map((x) => x.trim()).filter(Boolean)
-  const projects = (input.projects ?? []).map((x) => x.trim()).filter(Boolean)
-  const milestone = (input.milestone ?? "").trim()
-  const base = (input.base ?? "").trim()
-
-  const args = [
-    "pr",
-    "edit",
-    pr,
-    "-R",
-    repoArg(host, upstream),
-    ...(base ? ["--base", base] : []),
-    ...(input.title !== undefined ? ["--title", input.title] : []),
-    ...(input.body !== undefined ? ["--body", input.body] : []),
-    ...(labels.length ? ["--add-label", labels.join(",")] : []),
-    ...(reviewers.length ? ["--add-reviewer", reviewers.join(",")] : []),
-    ...(assignees.length ? ["--add-assignee", assignees.join(",")] : []),
-    ...(projects.length ? ["--add-project", projects.join(",")] : []),
-    ...(milestone ? ["--milestone", milestone] : []),
-  ]
-  const res = await ctx.$.cwd(root)`gh ${args}`.env({ GH_HOST: host }).nothrow().quiet()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: gh pr edit failed: ${res.stderr.toString() || res.stdout.toString()}`)
-  }
-}
-
-async function ghJson(ctx: any, root: string, host: string, args: string[]) {
-  const res = await ctx.$.cwd(root)`gh ${args}`.env({ GH_HOST: host }).nothrow().quiet()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: gh failed: ${res.stderr.toString() || res.stdout.toString()}`)
-  }
-  const text = res.text().trim()
-  if (!text) throw new Error("workbench: gh returned empty output")
-  return JSON.parse(text)
-}
-
-async function ghRepoInfo(ctx: any, root: string, host: string, repo?: string): Promise<GhRepo> {
-  const args = repo
-    ? ["repo", "view", repo, "--json", "nameWithOwner,isFork,parent,sshUrl"]
-    : ["repo", "view", "--json", "nameWithOwner,isFork,parent,sshUrl"]
-  return (await ghJson(ctx, root, host, args)) as GhRepo
-}
-
-async function ghUser(ctx: any, root: string, host: string): Promise<string> {
-  const res = await ctx.$.cwd(root)`gh api user --jq .login --hostname ${host}`.env({ GH_HOST: host }).nothrow().quiet()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: gh api user failed: ${res.stderr.toString() || res.stdout.toString()}`)
-  }
-  const login = res.text().trim()
-  if (!login) throw new Error("workbench: failed to resolve gh user login")
-  return login
-}
-
-async function ghProtocol(ctx: any, root: string, host: string): Promise<"ssh" | "https" | ""> {
-  const res = await ctx.$.cwd(root)`gh config get git_protocol -h ${host}`.env({ GH_HOST: host }).nothrow().quiet()
-  if (res.exitCode !== 0) return ""
-  const text = res.text().trim().toLowerCase()
-  if (text === "ssh") return "ssh"
-  if (text === "https") return "https"
-  return ""
-}
-
-async function gitRemoteUrl(ctx: any, root: string, name: string) {
-  const res = await ctx.$`git -C ${root} remote get-url ${name}`.nothrow().quiet()
-  if (res.exitCode !== 0) return ""
-  return res.text().trim()
-}
-
-async function gitSetRemote(ctx: any, root: string, name: string, url: string) {
-  const existing = await gitRemoteUrl(ctx, root, name)
-  if (!existing) {
-    const add = await ctx.$`git -C ${root} remote add ${name} ${url}`.nothrow().quiet()
-    if (add.exitCode !== 0) {
-      throw new Error(`workbench: failed to add remote ${name}: ${add.stderr.toString() || add.stdout.toString()}`)
-    }
-    return
-  }
-  if (existing === url) return
-  const set = await ctx.$`git -C ${root} remote set-url ${name} ${url}`.nothrow().quiet()
-  if (set.exitCode !== 0) {
-    throw new Error(`workbench: failed to set remote ${name}: ${set.stderr.toString() || set.stdout.toString()}`)
-  }
-}
-
-function originProtocol(origin: string): "ssh" | "https" {
-  if (origin.startsWith("http://") || origin.startsWith("https://")) return "https"
-  if (origin.startsWith("ssh://") || origin.startsWith("git@")) return "ssh"
-  return "https"
-}
-
-async function gitFetch(ctx: any, root: string, remote: string) {
-  const res = await ctx.$`git -C ${root} fetch --prune ${remote}`.nothrow().quiet()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: git fetch failed (${remote}): ${res.stderr.toString() || res.stdout.toString()}`)
-  }
-}
-
-async function gitCommon(ctx: any, dir: string) {
-  const res = await ctx.$`git -C ${dir} rev-parse --git-common-dir`.nothrow().quiet()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: not a git worktree: ${dir}`)
-  }
-  const out = res.text().trim()
-  if (!out) throw new Error(`workbench: failed to resolve git common dir: ${dir}`)
-  return path.resolve(dir, out)
-}
-
-async function prepareGithub(
-  ctx: any,
-  root: string,
-  input: {
-    host: string
-    repo?: string
+function mergeGithubMetadata(
+  existing: Entry["github"] | undefined,
+  args: {
+    ghHost?: string
+    upstream?: string
     fork?: string
-    protocol: "auto" | "ssh" | "https"
-    upstreamRemote: string
-    forkRemote: string
-    fetch: boolean
+    prUrl?: string
   },
-  log: (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, any>) => void,
+  clearSet: Set<string>,
 ) {
-  await ensureGh(ctx, input.host, root)
+  const clearGithub = hasClear(clearSet, "github")
 
-  const current = await ghRepoInfo(ctx, root, input.host, input.repo)
-  const upstream = current.isFork ? (current.parent?.nameWithOwner ?? "") : current.nameWithOwner
-  if (!upstream) throw new Error("workbench: failed to resolve upstream repo (try passing repo=OWNER/REPO)")
+  const host = (() => {
+    if (clearGithub || hasClear(clearSet, "ghhost")) return ""
+    return (args.ghHost ?? existing?.host ?? "").trim()
+  })()
 
-  const upstreamInfo = await ghRepoInfo(ctx, root, input.host, upstream)
-  const origin = await gitRemoteUrl(ctx, root, "origin")
-  const protocol =
-    input.protocol === "auto"
-      ? ((await ghProtocol(ctx, root, input.host)) || originProtocol(origin))
-      : input.protocol
-  const upstreamUrl =
-    protocol === "https" ? httpsClone(input.host, upstreamInfo.nameWithOwner) : sshClone(input.host, upstreamInfo.sshUrl, upstreamInfo.nameWithOwner)
-  if (!upstreamUrl) throw new Error("workbench: failed to resolve upstream repo URL")
-
-  const repoName = upstream.split("/")[1] ?? ""
-  if (!repoName) throw new Error("workbench: invalid upstream repo")
+  const upstream = (() => {
+    if (clearGithub || hasClear(clearSet, "upstream")) return ""
+    if (args.upstream !== undefined) return normalizeRepoRef("upstream", String(args.upstream || "").trim())
+    return String(existing?.upstream || "").trim()
+  })()
 
   const fork = (() => {
-    if (input.fork && input.fork.includes("/")) return input.fork
-    if (current.isFork) return current.nameWithOwner
-    return ""
+    if (clearGithub || hasClear(clearSet, "fork")) return ""
+    if (args.fork !== undefined) return normalizeRepoRef("fork", String(args.fork || "").trim())
+    return String(existing?.fork || "").trim()
   })()
 
-  const forkName = fork || `${await ghUser(ctx, root, input.host)}/${repoName}`
-
-  const forkCmd = await ctx.$.cwd(root)`gh repo fork ${upstream} --clone=false --remote --remote-name ${input.forkRemote}`
-    .env({ GH_HOST: input.host })
-    .nothrow()
-    .quiet()
-  if (forkCmd.exitCode !== 0) {
-    log("warn", "gh repo fork failed (continuing to validate via repo view)", {
-      upstream,
-      forkRemote: input.forkRemote,
-      stderr: forkCmd.stderr.toString(),
-      stdout: forkCmd.stdout.toString(),
-    })
-  }
-
-  const forkInfo = await (async () => {
-    const delays = [0, 500, 1000, 2000, 4000]
-    for (const delay of delays) {
-      if (delay) await new Promise((r) => setTimeout(r, delay))
-      const info = await ghRepoInfo(ctx, root, input.host, forkName).catch(() => null)
-      if (info?.nameWithOwner) return info
-    }
-    return null
+  const prUrl = (() => {
+    if (clearGithub || hasClear(clearSet, "prurl")) return ""
+    if (args.prUrl !== undefined) return normalizePrUrl(String(args.prUrl || "").trim())
+    return String(existing?.prUrl || "").trim()
   })()
-  if (!forkInfo?.nameWithOwner) {
-    throw new Error(`workbench: fork repo not accessible: ${forkName}`)
-  }
-  const forkUrl = protocol === "https" ? httpsClone(input.host, forkInfo.nameWithOwner) : sshClone(input.host, forkInfo.sshUrl, forkInfo.nameWithOwner)
-  if (!forkUrl) throw new Error("workbench: failed to resolve fork repo URL")
 
-  await gitSetRemote(ctx, root, input.upstreamRemote, upstreamUrl)
-  await gitSetRemote(ctx, root, input.forkRemote, forkUrl)
-
-  const defaultBranch = await ghDefaultBranch(ctx, root, input.host, upstream)
-    .catch(async (err) => {
-      log("warn", "failed to resolve default branch via gh api", {
-        upstream,
-        error: err instanceof Error ? err.message : String(err),
-      })
+  const fromPrHost = (() => {
+    if (!prUrl) return ""
+    try {
+      return new URL(prUrl).host
+    } catch {
       return ""
-    })
-
-  if (input.fetch) {
-    const remotes = [input.upstreamRemote, input.forkRemote]
-    for (const remote of Array.from(new Set(remotes))) {
-      await gitFetch(ctx, root, remote)
     }
-  }
+  })()
 
-  const fallback = defaultBranch || (await gitRemoteHead(ctx, root, input.upstreamRemote).catch(() => ""))
-  const resolved = fallback || "main"
-  if (!fallback) {
-    log("warn", "default branch fallback in effect", {
-      upstream,
-      picked: resolved,
-      reason: "gh api + remote HEAD unavailable",
-    })
-  }
+  const finalHost = (host || fromPrHost).trim()
 
   return {
-    upstream,
-    fork: forkInfo.nameWithOwner,
-    protocol,
-    defaultBranch: resolved,
-    remotes: {
-      upstream: input.upstreamRemote,
-      fork: input.forkRemote,
-    },
+    ...(finalHost ? { host: finalHost } : {}),
+    ...(upstream ? { upstream } : {}),
+    ...(fork ? { fork } : {}),
+    ...(prUrl ? { prUrl } : {}),
   }
 }
 
-async function branch(ctx: any, fallbackRoot: string) {
-  const info = await ctx.client.vcs.get({ query: { directory: ctx.directory } }).catch(() => null)
-  const data = info ? unwrap<{ branch?: string }>(info) : null
-  const b = typeof data?.branch === "string" ? data.branch.trim() : ""
-  if (b) return b
+const sessionTaskTails = new Map<string, Promise<void>>()
 
-  const out = await ctx.$`git -C ${fallbackRoot} rev-parse --short HEAD`.nothrow().quiet()
-  const sha = out.exitCode === 0 ? out.text().trim() : "unknown"
-  return `detached-${sha || "unknown"}`
+async function runSessionTaskSerial<T>(sessionID: string, execute: () => Promise<T>) {
+  const keyID = String(sessionID || "").trim()
+  if (!keyID) {
+    const started = Date.now()
+    const value = await execute()
+    return {
+      value,
+      queuedMs: 0,
+      runMs: Math.max(0, Date.now() - started),
+      queued: false,
+    }
+  }
+
+  const queueStart = Date.now()
+  const tail = sessionTaskTails.get(keyID) ?? Promise.resolve()
+  let release = () => {}
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const next = tail.catch(() => {}).then(() => gate)
+  sessionTaskTails.set(keyID, next)
+
+  await tail.catch(() => {})
+  const queuedMs = Math.max(0, Date.now() - queueStart)
+  const runStart = Date.now()
+  try {
+    const value = await execute()
+    return {
+      value,
+      queuedMs,
+      runMs: Math.max(0, Date.now() - runStart),
+      queued: queuedMs > 0,
+    }
+  } finally {
+    release()
+    next.finally(() => {
+      if (sessionTaskTails.get(keyID) === next) {
+        sessionTaskTails.delete(keyID)
+      }
+    })
+  }
+}
+
+function stateHome() {
+  const state = process.env.XDG_STATE_HOME?.trim()
+    ? process.env.XDG_STATE_HOME!.trim()
+    : path.join(os.homedir(), ".local", "state")
+  return path.join(state, "opencode", "workbench")
 }
 
 async function ensureDir(dir: string) {
@@ -773,1518 +383,1084 @@ async function ensureDir(dir: string) {
   return dir
 }
 
-function lockname(input: string) {
-  return `${key(input)}-${hash(input)}`
+async function gitCommonDir(ctx: any, dir: string): Promise<string> {
+  const res = await ctx.$`git -C ${dir} rev-parse --git-common-dir`.nothrow().quiet()
+  if (res.exitCode !== 0) return ""
+  const out = res.text().trim()
+  if (!out) return ""
+  return path.resolve(dir, out)
 }
 
-async function withLock<R>(
-  file: string,
-  input: {
-    timeoutMs: number
-    force: boolean
-    info: Record<string, unknown>
-  },
-  fn: () => Promise<R>,
-): Promise<R> {
-  await ensureDir(path.dirname(file))
-  const now = Date.now()
-
-  async function acquire() {
-    const handle = await open(file, "wx").catch((error) => {
-      const err = error as { code?: string }
-      if (err?.code === "EEXIST") return null
-      throw error
-    })
-    if (!handle) return false
-    await handle.writeFile(JSON.stringify({ ...input.info, pid: process.pid, time: now }, null, 2) + "\n")
-    await handle.close()
-    return true
-  }
-
-  for (let i = 0; i < 2; i++) {
-    if (await acquire()) {
-      try {
-        return await fn()
-      } finally {
-        await rm(file, { force: true }).catch(() => {})
-      }
-    }
-
-    const st = await stat(file).catch(() => null)
-    if (!st) continue
-    const age = now - st.mtimeMs
-    if (input.force || (input.timeoutMs > 0 && age > input.timeoutMs)) {
-      await rm(file, { force: true }).catch(() => {})
-      continue
-    }
-
-    const detail = await Bun.file(file)
-      .text()
-      .then((x) => x.trim())
-      .catch(() => "")
-    throw new Error(`workbench: locked (${Math.ceil(age / 1000)}s old) ${detail ? "\n" + detail : ""}`)
-  }
-
-  throw new Error("workbench: failed to acquire lock")
-}
-
-async function makeWorktree(ctx: any, root: string, outDir: string, b: string, from?: string) {
-  await ensureDir(path.dirname(outDir))
-  const exists = await Bun.file(outDir).exists().catch(() => false)
-  if (exists) {
-    const head = await ctx.$`git -C ${outDir} rev-parse --abbrev-ref HEAD`.nothrow().quiet()
-    if (head.exitCode !== 0) {
-      throw new Error(`workbench: worktree dir exists but is not a git worktree: ${outDir}`)
-    }
-    const current = head.text().trim()
-    if (current !== b) {
-      throw new Error(`workbench: worktree dir exists but is on '${current}', expected '${b}': ${outDir}`)
-    }
-    return outDir
-  }
-
-  const ref = (from ?? "").trim()
-  const check = await ctx.$`git -C ${root} show-ref --verify --quiet refs/heads/${b}`.nothrow().quiet()
-  const cmd =
-    check.exitCode === 0
-      ? ctx.$`git -C ${root} worktree add ${outDir} ${b}`
-      : ctx.$`git -C ${root} worktree add -b ${b} ${outDir} ${ref || "HEAD"}`
-  const res = await cmd.nothrow()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: failed to create worktree for ${b}: ${res.stderr.toString() || res.stdout.toString()}`)
-  }
-  return outDir
-}
-
-async function archive(ctx: any, src: string, dst: string, tmp: string) {
-  await ensureDir(dst)
-  await ensureDir(tmp)
-  const tar = path.join(tmp, `archive-${Date.now()}-${randomBytes(4).toString("hex")}.tar`)
-  const create = await ctx.$`git -C ${src} archive --format=tar -o ${tar} HEAD`.nothrow().quiet()
-  if (create.exitCode !== 0) {
-    throw new Error(`workbench: git archive failed: ${create.stderr.toString() || create.stdout.toString()}`)
-  }
-  const extract = await ctx.$`tar -xf ${tar} -C ${dst}`.nothrow().quiet()
-  await rm(tar, { force: true }).catch(() => {})
-  if (extract.exitCode !== 0) {
-    throw new Error(`workbench: tar extract failed: ${extract.stderr.toString() || extract.stdout.toString()}`)
-  }
-}
-
-function rule(args: any, meta?: Meta) {
-  const mode = (args.copyExcludeMode ?? meta?.copy?.excludeMode ?? "append") as "append" | "replace"
-  if (args.copyExclude !== undefined) {
-    const list = uniq((Array.isArray(args.copyExclude) ? (args.copyExclude as unknown[]) : []).map((x: unknown) => String(x)))
-    return {
-      mode,
-      exclude: mode === "replace" ? list : uniq([...DEFAULT_EXCLUDE, ...list]),
-    }
-  }
-  if (meta?.copy?.exclude) {
-    return {
-      mode: (meta.copy.excludeMode ?? "append") as "append" | "replace",
-      exclude: uniq(meta.copy.exclude.map((x) => String(x))),
-    }
-  }
-  return {
-    mode: "append" as const,
-    exclude: uniq(DEFAULT_EXCLUDE),
-  }
-}
-
-async function planFiles(ctx: any, src: string, dst: string, exclude: string[], input?: { delete?: boolean }) {
-  const rsync = Bun.which("rsync")
-  if (!rsync) throw new Error("workbench: preview requires rsync")
-
-  const list = uniq([...exclude, ".git", META])
-  const from = src.endsWith(path.sep) ? src : src + path.sep
-  const to = dst.endsWith(path.sep) ? dst : dst + path.sep
-  const args = ["-ani", ...(input?.delete ? ["--delete"] : []), ...list.flatMap((p) => ["--exclude", p]), from, to]
-  const res = await ctx.$`${rsync} ${args}`.nothrow().quiet()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: rsync preview failed: ${res.stderr.toString() || res.stdout.toString()}`)
-  }
-  return String(res.text())
-    .split("\n")
-    .map((x: string) => x.trimEnd())
-    .filter(Boolean)
-}
-
-async function syncFiles(ctx: any, src: string, dst: string, tmp: string, exclude: string[], input?: { delete?: boolean }) {
-  const list = uniq([...exclude, ".git", META])
-  const rsync = Bun.which("rsync")
-  if (rsync) {
-    const from = src.endsWith(path.sep) ? src : src + path.sep
-    const to = dst.endsWith(path.sep) ? dst : dst + path.sep
-    const args = ["-a", ...(input?.delete ? ["--delete"] : []), ...list.flatMap((p) => ["--exclude", p]), from, to]
-    const res = await ctx.$`${rsync} ${args}`.nothrow().quiet()
-    if (res.exitCode !== 0) {
-      throw new Error(`workbench: rsync failed: ${res.stderr.toString() || res.stdout.toString()}`)
-    }
-    return
-  }
-
-  if (input?.delete) {
-    throw new Error("workbench: delete=true requires rsync")
-  }
-
-  await ensureDir(tmp)
-  const tar = path.join(tmp, `sync-${Date.now()}-${randomBytes(4).toString("hex")}.tar`)
-  const tarEx = list.flatMap((p) => ["--exclude", p, "--exclude", "./" + p, "--exclude", "*/" + p, "--exclude", "./*/" + p])
-  const create = await ctx.$`tar -C ${src} ${tarEx} -cf ${tar} .`.nothrow().quiet()
-  if (create.exitCode !== 0) {
-    throw new Error(`workbench: tar pack failed: ${create.stderr.toString() || create.stdout.toString()}`)
-  }
-  const extract = await ctx.$`tar -C ${dst} -xf ${tar}`.nothrow().quiet()
-  await rm(tar, { force: true }).catch(() => {})
-  if (extract.exitCode !== 0) {
-    throw new Error(`workbench: tar unpack failed: ${extract.stderr.toString() || extract.stdout.toString()}`)
-  }
-}
-
-async function gitPorcelain(ctx: any, dir: string) {
-  const res = await ctx.$`git -C ${dir} status --porcelain --untracked-files=all`.nothrow().quiet()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: git status failed: ${res.stderr.toString() || res.stdout.toString()}`)
-  }
-  return String(res.text()).trim()
-}
-
-async function gitBranch(ctx: any, dir: string) {
+async function gitBranch(ctx: any, dir: string): Promise<string> {
   const res = await ctx.$`git -C ${dir} rev-parse --abbrev-ref HEAD`.nothrow().quiet()
   if (res.exitCode !== 0) return ""
-  return String(res.text()).trim()
-}
-
-async function gitStage(ctx: any, dir: string, mode: "all" | "tracked") {
-  const res =
-    mode === "tracked" ? await ctx.$`git -C ${dir} add -u`.nothrow() : await ctx.$`git -C ${dir} add -A`.nothrow()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: git add failed: ${res.stderr.toString() || res.stdout.toString()}`)
-  }
-}
-
-async function gitStaged(ctx: any, dir: string) {
-  const res = await ctx.$`git -C ${dir} diff --cached --name-only`.nothrow().quiet()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: git diff --cached failed: ${res.stderr.toString() || res.stdout.toString()}`)
-  }
-  return String(res.text()).trim()
-}
-
-async function gitCommit(
-  ctx: any,
-  dir: string,
-  title: string,
-  input?: {
-    body?: string
-    noVerify?: boolean
-    sign?: boolean
-  },
-) {
-  const body = (input?.body ?? "").trim()
-  const args = [
-    "-C",
-    dir,
-    "commit",
-    ...(input?.noVerify ? ["--no-verify"] : []),
-    ...(input?.sign ? [] : ["--no-gpg-sign"]),
-    "-m",
-    title,
-    ...(body ? ["-m", body] : []),
-  ]
-  const res = await ctx.$`git ${args}`.nothrow()
-  if (res.exitCode !== 0) {
-    const out = (res.stderr.toString() || res.stdout.toString()).trim()
-    throw new Error(`workbench: git commit failed${out ? `: ${out}` : ""}`)
-  }
-}
-
-async function gitPush(ctx: any, dir: string, remote: string, branch: string) {
-  const res = await ctx.$`git -C ${dir} push -u ${remote} ${branch}`.nothrow()
-  if (res.exitCode !== 0) {
-    throw new Error(`workbench: git push failed: ${res.stderr.toString() || res.stdout.toString()}`)
-  }
-}
-
-async function allSandboxes(base: string) {
-  const out: Array<{ dir: string; meta: Meta }> = []
-  const sandboxes = path.join(base, "sandboxes")
-  const projs = await readdir(sandboxes, { withFileTypes: true }).catch(() => [])
-  for (const p of projs) {
-    if (!p.isDirectory()) continue
-    const proj = path.join(sandboxes, p.name)
-    const dirs = await readdir(proj, { withFileTypes: true }).catch(() => [])
-    for (const d of dirs) {
-      if (!d.isDirectory()) continue
-      const dir = path.join(proj, d.name)
-      const meta = await readMeta(dir).catch(() => null)
-      if (!meta) continue
-      out.push({ dir, meta })
-    }
-  }
+  const out = res.text().trim()
+  if (!out || out === "HEAD") return ""
   return out
 }
 
-function formatList(items: Array<{ dir: string; meta: Meta }>) {
-  if (!items.length) return "workbench: no sandboxes"
-  const lines: string[] = []
-  for (const item of items.sort((a, b) => b.meta.time.created - a.meta.time.created)) {
-    const pr = item.meta.github?.pr?.url
-    const prid = pr ? pr.match(/\/pull\/(\d+)/)?.[1] : ""
-    const commit = item.meta.publish?.commit ? item.meta.publish.commit.slice(0, 8) : ""
-    lines.push(
-      [
-        item.meta.name,
-        item.meta.branch ? `branch=${item.meta.branch}` : undefined,
-        item.meta.copy?.mode ? `copy=${item.meta.copy.mode}` : undefined,
-        item.meta.session?.id ? `session=${item.meta.session.id}` : undefined,
-        prid ? `pr=${prid}` : undefined,
-        commit ? `commit=${commit}` : undefined,
-        `sandbox=${item.meta.sandbox.path}`,
-        `source=${item.meta.source.worktree}`,
-      ]
-        .filter(Boolean)
-        .join(" "),
-    )
-  }
-  return lines.join("\n")
+async function gitTopLevel(ctx: any, dir: string): Promise<string> {
+  const res = await ctx.$`git -C ${dir} rev-parse --show-toplevel`.nothrow().quiet()
+  if (res.exitCode !== 0) return ""
+  return res.text().trim()
 }
 
-async function resolveSandbox(ctx: any, nameOrPath: string) {
-  const input = (nameOrPath ?? "").trim()
-  if (!input) throw new Error("workbench: sandbox is required")
+async function gitOrigin(ctx: any, dir: string): Promise<string> {
+  const res = await ctx.$`git -C ${dir} config --get remote.origin.url`.nothrow().quiet()
+  if (res.exitCode !== 0) return ""
+  return res.text().trim()
+}
 
-  if (path.isAbsolute(input)) {
-    const meta = await readMeta(input)
-    if (!meta) throw new Error("workbench: sandbox metadata not found")
-    return { dir: input, meta }
+async function gitRootCommit(ctx: any, dir: string): Promise<string> {
+  const res = await ctx.$`git -C ${dir} rev-list --max-parents=0 HEAD`.nothrow().quiet()
+  if (res.exitCode !== 0) return ""
+  const out = res.text().trim()
+  if (!out) return ""
+  return out.split(/\s+/)[0] ?? ""
+}
+
+async function detectRepo(ctx: any, dir: string) {
+  const commonDir = await gitCommonDir(ctx, dir)
+  const origin = commonDir ? await gitOrigin(ctx, dir) : ""
+  const root = commonDir ? await gitRootCommit(ctx, dir) : ""
+  return {
+    commonDir,
+    origin,
+    root,
+  }
+}
+
+function requireGitRepo(commonDir: string, dir: string) {
+  if (commonDir) return path.resolve(commonDir)
+  throw new Error(
+    `workbench: no git repository detected for ${JSON.stringify(path.resolve(dir))}. Create or initialize a git repository first (for example: git init), then retry workbench.`,
+  )
+}
+
+function toRepoMeta(repo: { commonDir: string; origin?: string; root?: string }) {
+  const commonDir = path.resolve(repo.commonDir)
+  const origin = String(repo.origin || "").trim()
+  const root = String(repo.root || "").trim()
+  return {
+    commonDir,
+    ...(origin ? { origin } : {}),
+    ...(root ? { root } : {}),
+  }
+}
+
+function repoIdentityChanged(prev: Entry["repo"] | undefined, next: { commonDir: string; origin?: string; root?: string }) {
+  const prevCommon = String(prev?.commonDir || "").trim()
+  const prevOrigin = String(prev?.origin || "").trim()
+  const prevRoot = String(prev?.root || "").trim()
+  const nextCommon = String(next.commonDir || "").trim()
+  const nextOrigin = String(next.origin || "").trim()
+  const nextRoot = String(next.root || "").trim()
+
+  if (prevCommon && path.resolve(prevCommon) !== path.resolve(nextCommon)) return true
+  if (prevOrigin && prevOrigin !== nextOrigin) return true
+  if (prevRoot && prevRoot !== nextRoot) return true
+  return false
+}
+
+function repoMetaDiffers(prev: Entry["repo"] | undefined, next: { commonDir: string; origin?: string; root?: string }) {
+  const prevCommon = String(prev?.commonDir || "").trim()
+  const prevOrigin = String(prev?.origin || "").trim()
+  const prevRoot = String(prev?.root || "").trim()
+  const nextCommon = String(next.commonDir || "").trim()
+  const nextOrigin = String(next.origin || "").trim()
+  const nextRoot = String(next.root || "").trim()
+  if (!prevCommon) return true
+  if (path.resolve(prevCommon) !== path.resolve(nextCommon)) return true
+  if (prevOrigin !== nextOrigin) return true
+  if (prevRoot !== nextRoot) return true
+  return false
+}
+
+async function resolveDirectoryPath(ctx: any, cwd: string, raw: string) {
+  const dir = raw.trim()
+  if (!dir) return ""
+  const top = await gitTopLevel(ctx, cwd)
+  const rel = dir.replace(/^\.\//, "")
+  if (!top && (rel === ".workbench" || rel.startsWith(".workbench/"))) return ""
+  if (path.isAbsolute(dir)) return path.resolve(dir)
+  if (rel === ".workbench" || rel.startsWith(".workbench/")) return path.resolve(top || cwd, dir)
+  return path.resolve(cwd, dir)
+}
+
+function repoGroup(commonDir: string, worktreeDir: string) {
+  const seed = commonDir || path.resolve(worktreeDir)
+  const label = commonDir ? path.basename(path.dirname(commonDir)) : path.basename(path.resolve(worktreeDir))
+  const group = `${key(label)}-${hash(seed)}`
+  return {
+    group,
+    seed,
+  }
+}
+
+function entryPath(base: string, group: string, name: string) {
+  const file = `${key(name)}.json`
+  return path.join(base, "entries", group, file)
+}
+
+async function readEntry(file: string): Promise<Entry | null> {
+  const src = Bun.file(file)
+  if (!(await src.exists())) return null
+  const raw = await src.text().catch(() => "")
+  if (!raw.trim()) return null
+  try {
+    const data = JSON.parse(raw) as Entry
+    if (!data || typeof data !== "object") return null
+    if (data.version !== 1) return null
+    if (!data.name || !data.worktree?.path) return null
+    return data
+  } catch {
+    return null
+  }
+}
+
+async function writeEntry(file: string, entry: Entry) {
+  const now = Date.now()
+  const prev = Number(entry.time?.updated || 0) || 0
+  const updated = now > prev ? now : prev + 1
+  const next: Entry = {
+    ...entry,
+    time: {
+      ...entry.time,
+      updated,
+    },
+  }
+  await ensureDir(path.dirname(file))
+  await Bun.write(file, JSON.stringify(next, null, 2) + "\n")
+  return next
+}
+
+async function removeEntryFile(file: string) {
+  if (!(await Bun.file(file).exists())) return false
+  await rm(file, { force: true }).catch(() => {})
+  return !(await Bun.file(file).exists())
+}
+
+async function syncEntryRepo(file: string, entry: Entry, repo: { commonDir: string; origin?: string; root?: string }) {
+  const nextRepo = toRepoMeta(repo)
+  const changed = repoIdentityChanged(entry.repo, nextRepo)
+  const differs = repoMetaDiffers(entry.repo, nextRepo)
+  if (!changed && !differs) return entry
+
+  return await writeEntry(file, {
+    ...entry,
+    repo: nextRepo,
+    ...(changed ? { github: {}, session: undefined } : {}),
+    time: entry.time,
+  })
+}
+
+async function listAllEntries(base: string) {
+  const root = path.join(base, "entries")
+  const groups = await readdir(root, { withFileTypes: true }).catch(() => [])
+  const out: Array<{ file: string; entry: Entry }> = []
+  for (const g of groups) {
+    if (!g.isDirectory()) continue
+    const dir = path.join(root, g.name)
+    const files = await readdir(dir, { withFileTypes: true }).catch(() => [])
+    for (const f of files) {
+      if (!f.isFile()) continue
+      if (!f.name.endsWith(".json")) continue
+      const file = path.join(dir, f.name)
+      const entry = await readEntry(file)
+      if (!entry) continue
+      out.push({ file, entry })
+    }
+  }
+  return out.sort((a, b) => (b.entry.time.updated || b.entry.time.created) - (a.entry.time.updated || a.entry.time.created))
+}
+
+async function listAllLiveEntries(base: string) {
+  const all = await listAllEntries(base)
+  const live: Array<{ file: string; entry: Entry }> = []
+  for (const item of all) {
+    const st = await stat(item.entry.worktree.path).catch(() => null)
+    if (!st || !st.isDirectory()) {
+      await removeEntryFile(item.file)
+      continue
+    }
+    live.push(item)
+  }
+  return live
+}
+
+function formatList(items: Array<{ file: string; entry: Entry }>) {
+  if (!items.length) return "workbench: no bindings"
+  return items
+    .map(({ entry }) => {
+      const parts = [
+        entry.name,
+        entry.worktree.branch ? `branch=${entry.worktree.branch}` : "",
+        entry.session?.id ? `session=${entry.session.id}` : "",
+        entry.github?.prUrl ? `pr=${(entry.github.prUrl.match(/\/pull\/(\d+)/)?.[1] ?? "")}` : "",
+        `dir=${entry.worktree.path}`,
+      ].filter(Boolean)
+      return parts.join(" ")
+    })
+    .join("\n")
+}
+
+async function resolveEntryByDir(base: string, dir: string) {
+  const target = path.resolve(dir)
+  const matches = (await listAllLiveEntries(base)).filter(({ entry }) => path.resolve(entry.worktree.path) === target)
+  if (!matches.length) return null
+  if (matches.length > 1) {
+    for (const dup of matches.slice(1)) {
+      await removeEntryFile(dup.file)
+    }
+  }
+  return matches[0]
+}
+
+async function dedupeDirEntries(base: string, dir: string, keepFile: string) {
+  const target = path.resolve(dir)
+  const all = await listAllEntries(base)
+  for (const item of all) {
+    if (item.file === keepFile) continue
+    if (path.resolve(item.entry.worktree.path) !== target) continue
+    await removeEntryFile(item.file)
+  }
+}
+
+async function listRepoEntries(base: string, ctx: any, commonDir: string) {
+  const wanted = path.resolve(commonDir)
+  const all = await listAllLiveEntries(base)
+  const out: Array<{ file: string; entry: Entry }> = []
+  const seenDir = new Set<string>()
+  for (const item of all) {
+    const dir = path.resolve(item.entry.worktree.path)
+
+    const repo = await detectRepo(ctx, dir)
+    if (!repo.commonDir) {
+      await removeEntryFile(item.file)
+      continue
+    }
+
+    const normalized = toRepoMeta(repo as { commonDir: string; origin?: string; root?: string })
+    if (normalized.commonDir !== wanted) continue
+
+    const synced = await syncEntryRepo(item.file, item.entry, normalized)
+
+    if (seenDir.has(dir)) {
+      await removeEntryFile(item.file)
+      continue
+    }
+    seenDir.add(dir)
+    out.push({ file: item.file, entry: synced })
+  }
+  out.sort((a, b) => (b.entry.time.updated || b.entry.time.created) - (a.entry.time.updated || a.entry.time.created))
+  return out
+}
+
+async function resolveCurrentBinding(base: string, ctx: any, toolCtx: any, parentSessionId = "", childSessionId = "") {
+  const parent = parentSessionId.trim() || String(toolCtx?.sessionID || "").trim()
+  const child = childSessionId.trim()
+  const cwd = path.resolve(String(toolCtx?.directory || ctx.directory || "").trim() || process.cwd())
+
+  const live = await listAllLiveEntries(base)
+  if (child) {
+    const hit = live.find(({ entry }) => entry.session?.id === child)
+    if (hit) return hit
   }
 
-  const r = await roots(ctx)
-  const base = path.join(r.sandboxes, clean(ctx.project.id))
-  const dir = path.join(base, clean(input))
-  const meta = await readMeta(dir)
-  if (meta) return { dir, meta }
+  if (parent) {
+    const hit = live.find(({ entry }) => entry.session?.id === parent)
+    if (hit) return hit
+    const childHit = live.find(({ entry }) => entry.session?.parent === parent)
+    if (childHit) return childHit
+  }
 
-  const items = await allSandboxes(r.base)
-  const hit = items.find((x) => x.meta.name === input)
+  const top = await gitTopLevel(ctx, cwd)
+  const target = top ? path.resolve(top) : cwd
+  const hit = live.find(({ entry }) => path.resolve(entry.worktree.path) === target)
   if (hit) return hit
-  throw new Error("workbench: sandbox not found")
+
+  return null
+}
+
+async function listSessionBindings(base: string, ctx: any, toolCtx: any, parentSessionId = "", childSessionId = "") {
+  const parent = parentSessionId.trim() || String(toolCtx?.sessionID || "").trim()
+  const child = childSessionId.trim()
+  const cwd = path.resolve(String(toolCtx?.directory || ctx.directory || "").trim() || process.cwd())
+  const live = await listAllLiveEntries(base)
+
+  const ids = new Set<string>()
+  if (parent) ids.add(parent)
+  if (child) ids.add(child)
+
+  if (ids.size) {
+    const scoped = live.filter(({ entry }) => {
+      const sid = String(entry.session?.id || "").trim()
+      const pid = String(entry.session?.parent || "").trim()
+      if (!sid && !pid) return false
+      if (sid && ids.has(sid)) return true
+      if (pid && ids.has(pid)) return true
+      return false
+    })
+    if (scoped.length) return scoped
+  }
+
+  const top = await gitTopLevel(ctx, cwd)
+  const target = top ? path.resolve(top) : cwd
+  const hit = live.find(({ entry }) => path.resolve(entry.worktree.path) === target)
+  if (!hit) return []
+  return [hit]
+}
+
+async function resolveBindingByName(
+  base: string,
+  ctx: any,
+  toolCtx: any,
+  name: string,
+  dirArg: string,
+  parentSessionId: string,
+  childSessionId: string,
+) {
+  const targetName = key(name)
+  const cwd = path.resolve(String(toolCtx?.directory || ctx.directory || "").trim() || process.cwd())
+  const rawDir = dirArg.trim()
+
+  if (rawDir) {
+    const target = path.isAbsolute(rawDir) ? path.resolve(rawDir) : path.resolve(cwd, rawDir)
+    const repo = await detectRepo(ctx, target)
+    const commonDir = requireGitRepo(repo.commonDir, target)
+    return (await listRepoEntries(base, ctx, commonDir)).find(({ entry }) => key(entry.name) === targetName) ?? null
+  }
+
+  const scoped = (await listSessionBindings(base, ctx, toolCtx, parentSessionId, childSessionId)).filter(
+    ({ entry }) => key(entry.name) === targetName,
+  )
+  if (scoped.length === 1) return scoped[0]
+  if (scoped.length > 1) {
+    throw new Error(`workbench: binding name is ambiguous in this session scope: ${name}. Pass dir to disambiguate.`)
+  }
+
+  const current = await resolveCurrentBinding(base, ctx, toolCtx, parentSessionId, childSessionId)
+  if (current?.entry.repo?.commonDir) {
+    const repoScoped = (await listRepoEntries(base, ctx, current.entry.repo.commonDir)).find(
+      ({ entry }) => key(entry.name) === targetName,
+    )
+    if (repoScoped) return repoScoped
+  }
+
+  const all = (await listAllLiveEntries(base)).filter(({ entry }) => key(entry.name) === targetName)
+  if (all.length === 1) return all[0]
+  if (all.length > 1) {
+    throw new Error(`workbench: binding name is ambiguous: ${name}. Pass dir to disambiguate.`)
+  }
+  return null
+}
+
+async function resolveTaskTargetSession(base: string, ctx: any, sessionID: string) {
+  const sid = String(sessionID || "").trim()
+  if (!sid) return ""
+
+  const all = await listAllLiveEntries(base)
+  const direct = all.find(({ entry }) => entry.session?.id === sid)
+  if (direct?.entry.session?.id) return direct.entry.session.id
+
+  const children = all.filter(({ entry }) => entry.session?.parent === sid && entry.session?.id)
+  if (children.length === 1) return children[0].entry.session!.id
+  if (!children.length) return ""
+
+  const repo = await detectRepo(ctx, path.resolve(ctx.directory))
+  if (!repo.commonDir) return ""
+  const scoped = children.filter(({ entry }) => entry.repo?.commonDir && path.resolve(entry.repo.commonDir) === path.resolve(repo.commonDir!))
+  if (scoped.length === 1) return scoped[0].entry.session!.id
+
+  return ""
+}
+
+async function findEntryBySession(base: string, sessionID: string) {
+  const sid = String(sessionID || "").trim()
+  if (!sid) return null
+  const all = await listAllLiveEntries(base)
+  return all.find(({ entry }) => entry.session?.id === sid) ?? null
+}
+
+async function ensureTaskSessionForEntry(base: string, ctx: any, parentID: string, file: string, entry: Entry) {
+  const parent = String(parentID || "").trim()
+  if (entry.session?.id) {
+    if (!parent || entry.session.parent === parent) return entry.session.id
+  }
+
+  const title = `WB: ${entry.worktree.branch || entry.name}`
+  const created = await ctx.client.session.create({
+    query: { directory: entry.worktree.path },
+    body: {
+      ...(parent ? { parentID: parent } : {}),
+      title,
+    },
+  })
+  const session = unwrap<any>(created)
+  if (!session?.id) return ""
+
+  await writeEntry(file, {
+    ...entry,
+    session: {
+      id: session.id,
+      ...(parent ? { parent } : {}),
+      title,
+    },
+    time: entry.time,
+  })
+
+  return session.id
+}
+
+async function resolveTaskTargetByDirectory(base: string, ctx: any, sessionID: string, cwd: string, raw: string) {
+  const target = await resolveDirectoryPath(ctx, cwd, raw)
+  if (!target) return ""
+
+  const st = await stat(target).catch(() => null)
+  if (!st || !st.isDirectory()) return ""
+
+  const repo = await detectRepo(ctx, target)
+  const commonDir = requireGitRepo(repo.commonDir, target)
+  const repoMeta = toRepoMeta({ commonDir, origin: repo.origin, root: repo.root })
+
+  const all = await listAllLiveEntries(base)
+  const hit = all.find(({ entry }) => path.resolve(entry.worktree.path) === target)
+  if (hit) {
+    const entry = await syncEntryRepo(hit.file, hit.entry, repoMeta)
+    await dedupeDirEntries(base, target, hit.file)
+    return await ensureTaskSessionForEntry(base, ctx, sessionID, hit.file, entry)
+  }
+
+  const branch = await gitBranch(ctx, target)
+  const nameBase = (branch || path.basename(target) || "workbench").trim()
+  const group = repoGroup(commonDir, target).group
+
+  let suffix = 0
+  while (suffix < 1000) {
+    const candidate = suffix === 0 ? nameBase : `${nameBase}-${suffix + 1}`
+    const name = clean(candidate) || `workbench-${randomBytes(3).toString("hex")}`
+    const file = entryPath(base, group, name)
+    const existing = await readEntry(file)
+    if (existing && path.resolve(existing.worktree.path) !== target) {
+      suffix++
+      continue
+    }
+
+    const now = Date.now()
+    const entry: Entry = existing ?? {
+      version: 1,
+      id: randomBytes(8).toString("hex"),
+      name,
+      worktree: {
+        path: target,
+        ...(branch ? { branch } : {}),
+      },
+      repo: repoMeta,
+      github: {},
+      time: {
+        created: now,
+        updated: now,
+      },
+    }
+
+    const saved = await writeEntry(file, entry)
+    await dedupeDirEntries(base, target, file)
+    return await ensureTaskSessionForEntry(base, ctx, sessionID, file, saved)
+  }
+
+  return ""
+}
+
+async function resolveSessionMode(base: string, sessionID?: string) {
+  const sid = String(sessionID || "").trim()
+  if (!sid) return "default" as const
+
+  const all = await listAllLiveEntries(base)
+  if (all.some(({ entry }) => entry.session?.id === sid)) return "implementation" as const
+  if (all.some(({ entry }) => entry.session?.parent === sid)) return "supervisor" as const
+  return "default" as const
 }
 
 export const WorkbenchPlugin: Plugin = async (ctx) => {
-  const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, any>) => {
-    void Promise.resolve()
-      .then(() =>
-        ctx.client.app.log({
-          query: { directory: ctx.directory },
-          body: { service: "opencode-workbench", level, message, extra },
-        }),
-      )
-      .catch(() => {})
-  }
-
   return {
-    "experimental.chat.system.transform": async (_input, output) => {
+    "experimental.chat.system.transform": async (input, output) => {
       output.system.push(INJECTION)
+      const mode = await resolveSessionMode(stateHome(), input.sessionID)
+      if (mode === "supervisor") output.system.push(SUPERVISOR_HINT)
+      if (mode === "implementation") output.system.push(IMPLEMENTATION_HINT)
     },
-    "experimental.session.compacting": async (_input, output) => {
+    "experimental.session.compacting": async (input, output) => {
       output.context.push(INJECTION)
+      const mode = await resolveSessionMode(stateHome(), input.sessionID)
+      if (mode === "supervisor") output.context.push(SUPERVISOR_HINT)
+      if (mode === "implementation") output.context.push(IMPLEMENTATION_HINT)
+    },
+    "tool.definition": async (input, output) => {
+      if (input.toolID !== "task") return
+      output.description = `${output.description}\n\nWorkbench integration:\n- In supervisor/implementation workbench sessions, built-in task directory routing is guarded.\n- Use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." } for directory-aware implementation prompts.\n- If task_id is omitted in those sessions, workbench can still auto-route when unambiguous.`
+    },
+    "tool.execute.before": async (input, output) => {
+      const base = stateHome()
+
+      if (input.tool === "task") {
+        if (!output.args || typeof output.args !== "object" || Array.isArray(output.args)) return
+        const args = output.args as Record<string, unknown>
+
+        const mode = await resolveSessionMode(base, input.sessionID)
+        if (mode === "default") return
+
+        const raw = directoryArg(args)
+        if (raw) {
+          throw new Error(
+            'workbench: built-in task directory is disabled in supervisor/implementation mode. Use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.',
+          )
+        }
+
+        const existing = typeof args.task_id === "string" ? args.task_id.trim() : ""
+        if (existing) return
+        const routed = await resolveTaskTargetSession(base, ctx, input.sessionID)
+        if (routed) args.task_id = routed
+        return
+      }
+
+      const sid = String(input.sessionID || "").trim()
+      if (!sid) return
+
+      const all = await listAllLiveEntries(base)
+
+      const worker = all.find(({ entry }) => entry.session?.id === sid)
+      if (worker) {
+        const root = path.resolve(worker.entry.worktree.path)
+
+        if (input.tool === "read" || input.tool === "edit" || input.tool === "write") {
+          const target = resolvePath(root, fileArg(output.args))
+          if (target && !within(root, target)) {
+            throw new Error(
+              `workbench: ${input.tool} is restricted to ${JSON.stringify(root)} for this workbench session (got ${JSON.stringify(target)}).`,
+            )
+          }
+        }
+
+        if (input.tool === "glob" || input.tool === "grep") {
+          const target = resolvePath(root, pathArg(output.args))
+          if (target && !within(root, target)) {
+            throw new Error(
+              `workbench: ${input.tool} path is restricted to ${JSON.stringify(root)} for this workbench session (got ${JSON.stringify(target)}).`,
+            )
+          }
+        }
+
+        if (input.tool === "bash") {
+          const target = resolvePath(root, workdirArg(output.args))
+          if (target && !within(root, target)) {
+            throw new Error(
+              `workbench: bash workdir is restricted to ${JSON.stringify(root)} for this workbench session (got ${JSON.stringify(target)}).`,
+            )
+          }
+        }
+
+        return
+      }
+
+      const isSupervisor = all.some(({ entry }) => entry.session?.parent === sid)
+      if (!isSupervisor) return
+
+      if (input.tool !== "edit" && input.tool !== "write") return
+
+      const target = fileArg(output.args)
+      if (isGitignore(target)) return
+
+      throw new Error(
+        'workbench: supervisor sessions should not edit files directly. Use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." } in a pinned session; only .gitignore edits are allowed here.',
+      )
     },
     tool: {
       workbench: tool({
         description: DESCRIPTION,
         args: {
-          action: tool.schema.enum([
-            "help",
-            "create",
-            "open",
-            "list",
-            "info",
-            "doctor",
-            "preview",
-            "sync",
-            "publish",
-            "checkpoint",
-            "reset",
-            "rename",
-            "gc",
-            "cleanup",
-          ]),
-          branch: tool.schema.string().optional().describe("git branch name (default: current branch)"),
-          from: tool.schema.string().optional().describe("start point when creating a new branch worktree"),
-          base: tool.schema
+          action: tool.schema.enum(["help", "doctor", "list", "info", "bind", "open", "task", "remove"]),
+          scope: tool.schema.enum(["session", "repo", "all"]).optional().describe("when action=list, scope to show (default: session)"),
+          all: tool.schema.boolean().optional().describe("when action=list, alias for scope=all"),
+          name: tool.schema.string().optional().describe("binding name (defaults to branch or directory name)"),
+          dir: tool.schema
             .string()
             .optional()
-            .describe("base branch name when creating a new branch (default: auto via upstream default branch when github=true)"),
-          copyMode: tool.schema
-            .enum(["archive", "worktree"])
-            .optional()
-            .describe("how to snapshot source into sandbox: archive=git archive (tracked+committed), worktree=filesystem copy (includes local edits/untracked)"),
-          copyExclude: tool.schema
-            .array(tool.schema.string())
-            .optional()
-            .describe("exclude patterns for copyMode=worktree and sync/publish (rsync-style basenames, e.g. node_modules)"),
-          copyExcludeMode: tool.schema
-            .enum(["append", "replace"])
-            .optional()
-            .describe("how copyExclude is applied: append=DEFAULT+copyExclude, replace=only copyExclude"),
-          name: tool.schema.string().optional().describe("sandbox name (default: derived from branch + time)"),
-          sandbox: tool.schema
+            .describe(
+              "directory (bind/open/task: worktree dir; list/info/remove/doctor: anchor dir; default: current directory)",
+            ),
+          branch: tool.schema.string().optional().describe("branch name (optional; auto-detected when possible)"),
+          ghHost: tool.schema.string().optional().describe("GitHub host (e.g. github.com)"),
+          upstream: tool.schema.string().optional().describe("upstream repo OWNER/REPO"),
+          fork: tool.schema.string().optional().describe("fork repo OWNER/REPO"),
+          prUrl: tool.schema.string().optional().describe("PR url to record"),
+          clear: tool
+            .schema
             .string()
             .optional()
-            .describe("sandbox name (as created) or absolute path to the sandbox directory"),
-          renameTo: tool.schema.string().optional().describe("when action=rename, new sandbox name"),
-          gcApply: tool.schema.boolean().optional().describe("when action=gc, actually delete (default: dry-run)"),
-          gcDays: tool.schema
-            .number()
-            .optional()
-            .describe("when action=gc, remove sandboxes older than N days"),
-          gcKeepWithSession: tool.schema
-            .boolean()
-            .optional()
-            .describe("when action=gc, keep sandboxes that have a recorded session id"),
-          resetBackup: tool.schema
-            .boolean()
-            .optional()
-            .describe("when action=reset, create a checkpoint backup first"),
-          resetDelete: tool.schema
-            .boolean()
-            .optional()
-            .describe("when action=reset, delete extra files in sandbox (mirror source)"),
-          lockTimeout: tool.schema
-            .number()
-            .optional()
-            .describe("lock TTL seconds for sync/publish/reset (0 disables stale breaking)"),
-          force: tool.schema
-            .boolean()
-            .optional()
-            .describe("force operation (break locks, rename with session, etc.)"),
-          sourceWorktree: tool.schema
+            .describe("comma/space-separated fields to clear on bind (supported: github, ghHost, upstream, fork, prUrl)"),
+          title: tool.schema.string().optional().describe("when action=open, session title"),
+          prompt: tool
+            .schema
             .string()
             .optional()
-            .describe("existing worktree directory to archive from (skip managed git worktree creation)"),
-          targetWorktree: tool.schema
+            .describe("when action=open, initial message; when action=task, required prompt to run"),
+          task_id: tool
+            .schema
             .string()
             .optional()
-            .describe("target directory to sync into (default: recorded source worktree)"),
-          delete: tool.schema
-            .boolean()
-            .optional()
-            .describe("when syncing, propagate deletions from sandbox to target (requires rsync)"),
-          previewLines: tool.schema
-            .number()
-            .optional()
-            .describe("when action=preview, max lines to show"),
-          github: tool.schema
-            .boolean()
-            .optional()
-            .describe("run GitHub fork/remote wiring via gh before creating sandbox"),
-          ghHost: tool.schema.string().optional().describe("gh host (default: github.com)"),
-          repo: tool.schema
+            .describe("when action=task, optional target session id (otherwise auto-routes when possible)"),
+          sessionId: tool
+            .schema
             .string()
             .optional()
-            .describe("upstream repo in OWNER/REPO form (default: inferred by gh from current dir)"),
-          fork: tool.schema
+            .describe("optional child/target session id for session-scoped list/info/task routing"),
+          parentSessionId: tool
+            .schema
             .string()
             .optional()
-            .describe("fork repo in OWNER/REPO form (default: inferred; usually YOURLOGIN/REPO)"),
-          forkRemote: tool.schema.string().optional().describe("git remote name for fork"),
-          upstreamRemote: tool.schema.string().optional().describe("git remote name for upstream"),
-          protocol: tool.schema
-            .enum(["auto", "ssh", "https"])
-            .optional()
-            .describe("remote URL protocol used by gh wiring"),
-          fetch: tool.schema
+            .describe("optional parent session id (defaults to current tool session id) for session-scoped lookups"),
+          strict: tool
+            .schema
             .boolean()
             .optional()
-            .describe("when github=true, fetch upstream/fork remotes to ensure refs exist"),
-          push: tool.schema
-            .boolean()
-            .optional()
-            .describe("push branch to fork remote after worktree creation"),
-          pr: tool.schema
-            .boolean()
-            .optional()
-            .describe("when github=true, create (or reuse) a PR on upstream for this branch"),
-          draft: tool.schema
-            .boolean()
-            .optional()
-            .describe("when pr=true, create PR as draft"),
-          prBase: tool.schema
-            .string()
-            .optional()
-            .describe("PR base branch (default: base/auto -> upstream default branch)"),
-          prTitle: tool.schema.string().optional().describe("PR title (default: branch name)"),
-          prBody: tool.schema.string().optional().describe("PR body (default: empty)"),
-          prLabels: tool.schema.array(tool.schema.string()).optional().describe("PR labels to add"),
-          prReviewers: tool.schema.array(tool.schema.string()).optional().describe("PR reviewers to request"),
-          prAssignees: tool.schema.array(tool.schema.string()).optional().describe("PR assignees"),
-          prProjects: tool.schema.array(tool.schema.string()).optional().describe("PR projects to add"),
-          prMilestone: tool.schema.string().optional().describe("PR milestone name"),
-          prNoMaintainerEdit: tool.schema
-            .boolean()
-            .optional()
-            .describe("when pr=true, disable maintainer edits"),
-          commit: tool.schema
-            .boolean()
-            .optional()
-            .describe("when action=publish, create a commit (default: true)"),
-          commitMessage: tool.schema.string().optional().describe("when action=publish, commit title"),
-          commitBody: tool.schema.string().optional().describe("when action=publish, commit body"),
-          commitBodyAuto: tool.schema
-            .boolean()
-            .optional()
-            .describe("when action=publish and commitBody is empty, generate a file list body"),
-          stage: tool.schema
-            .enum(["all", "tracked"])
-            .optional()
-            .describe("when action=publish, stage changes: all=git add -A, tracked=git add -u"),
-          noVerify: tool.schema.boolean().optional().describe("when action=publish, pass --no-verify to git commit"),
-          sign: tool.schema
-            .boolean()
-            .optional()
-            .describe("when action=publish, keep git commit signing enabled (default: false -> use --no-gpg-sign)"),
-          allowDirty: tool.schema
-            .boolean()
-            .optional()
-            .describe("when action=publish, allow non-clean target worktree before sync"),
-          cleanupSandbox: tool.schema
-            .boolean()
-            .optional()
-            .describe("when action=publish, remove the sandbox after successful publish"),
-          title: tool.schema.string().optional().describe("title for the created session"),
-          prompt: tool.schema.string().optional().describe("optional initial message to send to the created session"),
-          removeWorktree: tool.schema
-            .boolean()
-            .optional()
-            .describe("when action=cleanup, also remove the managed worktree directory"),
+            .describe("when action=info and multiple bindings match, throw instead of auto-picking the latest"),
+          agent: tool.schema.string().optional().describe('when action=task, agent name (default: "general")'),
+          command: tool.schema.string().optional().describe("when action=task, optional command trigger text"),
+          force: tool.schema.boolean().optional().describe("when action=open, always create a new session"),
         },
         async execute(args, toolCtx) {
-          const r = await roots(ctx)
-          await ensureDir(r.sandboxes)
-          await ensureDir(r.worktrees)
-          await ensureDir(r.tmp)
-          await ensureDir(r.locks)
+          const base = stateHome()
+          await ensureDir(path.join(base, "entries"))
+          const childSessionId = sessionArg(args.sessionId)
+          const parentSessionId = sessionArg(args.parentSessionId) || String(toolCtx?.sessionID || "").trim()
+          const clearSet = clearSetArg(args.clear)
 
-          const conf0 = await loadConfig(getBase(ctx))
-          const opt0 = { ...conf0.config, ...args } as any
+          if (args.action === "help") return HELP
 
-          if (args.action === "help") {
-            return HELP
+          if (args.action === "task") {
+            const promptText = (args.prompt ?? "").trim()
+            if (!promptText) {
+              throw new Error("workbench: action=task requires a non-empty prompt")
+            }
+
+            const sessionID = parentSessionId
+            const cwd = path.resolve(String(toolCtx?.directory || ctx.directory || "").trim() || process.cwd())
+            const byDirInput = (args.dir ?? "").trim()
+
+            const byDir = byDirInput ? await resolveTaskTargetByDirectory(base, ctx, sessionID, cwd, byDirInput) : ""
+            if (byDirInput && !byDir) {
+              throw new Error(
+                `workbench: cannot route task for dir ${JSON.stringify(args.dir)}. Ensure the path exists and is a git worktree (prefer .workbench/<name>).`,
+              )
+            }
+
+            const byTask = (args.task_id ?? "").trim() || childSessionId
+            if (byTask && byDir && byTask !== byDir) {
+              throw new Error("workbench: action=task task_id conflicts with dir routing; use either task_id or a matching dir")
+            }
+
+            const routed = byTask || byDir || (await resolveTaskTargetSession(base, ctx, sessionID))
+            if (!routed) {
+              throw new Error(
+                'workbench: no target session resolved. Open a workbench session first or pass dir=".workbench/<name>".',
+              )
+            }
+
+            const entry = await findEntryBySession(base, routed)
+            const byPath = await resolveDirectoryPath(ctx, cwd, byDirInput)
+            const dir = entry?.entry.worktree.path || byPath
+            if (!dir) {
+              throw new Error(
+                'workbench: target session has no bound worktree directory. Re-open via workbench { action: "open", dir: ".workbench/<name>" }.',
+              )
+            }
+            const dirRepo = await detectRepo(ctx, dir)
+            requireGitRepo(dirRepo.commonDir || entry?.entry.repo?.commonDir || "", dir)
+
+            const prompt = (args.command ?? "").trim()
+              ? `[command trigger]\n${(args.command ?? "").trim()}\n\n${promptText}`
+              : promptText
+
+            const taskRun = await runSessionTaskSerial(routed, async () =>
+              await ctx.client.session.prompt({
+                path: { id: routed },
+                query: { directory: dir },
+                body: {
+                  agent: (args.agent ?? "").trim() || "general",
+                  parts: [{ type: "text", text: prompt }],
+                },
+              }),
+            )
+            const data = unwrap<any>(taskRun.value)
+            const text = taskText(data)
+
+            return [
+              `task_id: ${routed} (for resuming this workbench task if needed)`,
+              `task_queue_ms: ${taskRun.queuedMs}`,
+              `task_run_ms: ${taskRun.runMs}`,
+              `task_queued: ${taskRun.queued ? "yes" : "no"}`,
+              "",
+              "<task_result>",
+              text,
+              "</task_result>",
+            ].join("\n")
+          }
+
+          if (args.action === "doctor") {
+            const git = Bun.which("git")
+            const gh = Bun.which("gh")
+            const cwd = path.resolve(String(toolCtx?.directory || ctx.directory || "").trim() || process.cwd())
+            const dir = (args.dir ?? "").trim()
+            const target = dir
+              ? path.isAbsolute(dir)
+                ? path.resolve(dir)
+                : path.resolve(cwd, dir)
+              : cwd
+            const repo = await detectRepo(ctx, cwd)
+            return [
+              "workbench: doctor",
+              `- base: ${base}`,
+              `- tools: git=${git ? "ok" : "missing"} gh=${gh ? "ok" : "missing"}`,
+              `- session: ${String(toolCtx?.sessionID || "").trim() || "(unknown)"}`,
+              `- cwd: ${target}`,
+              `- git common dir: ${(await detectRepo(ctx, target)).commonDir || "(not detected)"}`,
+            ].join("\n")
           }
 
           if (args.action === "list") {
-            const items = await allSandboxes(r.base)
+            const scope = normalizeScope(args.scope, args.all)
+            if (scope === "all") {
+              const items = await listAllLiveEntries(base)
+              return formatList(items)
+            }
+
+            if (scope === "repo") {
+              const cwd = path.resolve(String(toolCtx?.directory || ctx.directory || "").trim() || process.cwd())
+              const dir = (args.dir ?? "").trim()
+              const target = dir
+                ? path.isAbsolute(dir)
+                  ? path.resolve(dir)
+                  : path.resolve(cwd, dir)
+                : cwd
+
+              const repo = await detectRepo(ctx, target)
+              const current = await resolveCurrentBinding(base, ctx, toolCtx, parentSessionId, childSessionId)
+              const commonDir = dir
+                ? requireGitRepo(repo.commonDir, target)
+                : requireGitRepo(repo.commonDir || current?.entry.repo?.commonDir || "", target)
+              const items = await listRepoEntries(base, ctx, commonDir)
+              return formatList(items)
+            }
+
+            // scope=session
+            const items = await listSessionBindings(base, ctx, toolCtx, parentSessionId, childSessionId)
+            if (!items.length) {
+              return "workbench: no binding for this session (use scope=repo and optionally dir=...; or use scope=all)"
+            }
             return formatList(items)
           }
 
           if (args.action === "info") {
-            const ref = await resolveSandbox(ctx, args.sandbox ?? "")
+            const name = (args.name ?? "").trim()
+            const cwd = path.resolve(String(toolCtx?.directory || ctx.directory || "").trim() || process.cwd())
+            const dirArg = (args.dir ?? "").trim()
+            const sessionMatches = !name && !dirArg ? await listSessionBindings(base, ctx, toolCtx, parentSessionId, childSessionId) : []
+            const strictInfo = args.strict === true
+            const entry = await (async (): Promise<Entry | null> => {
+              if (name) {
+                const hit = await resolveBindingByName(base, ctx, toolCtx, name, dirArg, parentSessionId, childSessionId)
+                return hit?.entry ?? null
+              }
+              if (dirArg) {
+                const target = path.isAbsolute(dirArg) ? path.resolve(dirArg) : path.resolve(cwd, dirArg)
+                const repo = await detectRepo(ctx, target)
+                requireGitRepo(repo.commonDir, target)
+                const hit = await resolveEntryByDir(base, target)
+                return hit?.entry ?? null
+              }
+              if (strictInfo && sessionMatches.length > 1) {
+                const names = sessionMatches.map(({ entry }) => entry.name).join(", ")
+                throw new Error(`workbench: multiple bindings match this session scope (${names}). Pass name or dir.`)
+              }
+              if (sessionMatches.length) return sessionMatches[0].entry
+              const current = await resolveCurrentBinding(base, ctx, toolCtx, parentSessionId, childSessionId)
+              return current?.entry ?? null
+            })()
+
+            if (!entry) {
+              return name
+                ? "workbench: binding not found"
+                : "workbench: no binding for this session (try: workbench { action: \"open\" })"
+            }
             const lines: string[] = []
             lines.push("workbench: info")
-            lines.push(`- name: ${ref.meta.name}`)
-            if (ref.meta.branch) lines.push(`- branch: ${ref.meta.branch}`)
-            if (ref.meta.copy?.mode) lines.push(`- copy: ${ref.meta.copy.mode}`)
-            lines.push(`- sandbox: ${ref.meta.sandbox.path}`)
-            lines.push(`- source worktree: ${ref.meta.source.worktree}`)
-            if (ref.meta.session?.id) {
-              lines.push(`- session: ${ref.meta.session.id}`)
-              lines.push(`Try: opencode run --session ${ref.meta.session.id} --dir ${JSON.stringify(ref.meta.sandbox.path)}`)
-            } else {
-              lines.push(`Try: workbench { action: "open", sandbox: ${JSON.stringify(ref.meta.name)} }`)
-            }
-            if (ref.meta.github?.upstream) {
-              const gh = ref.meta.github
+            lines.push(`- name: ${entry.name}`)
+            lines.push(`- dir: ${entry.worktree.path}`)
+            if (entry.worktree.branch) lines.push(`- branch: ${entry.worktree.branch}`)
+            if (entry.repo?.commonDir) lines.push(`- git common dir: ${entry.repo.commonDir}`)
+            if (entry.repo?.origin) lines.push(`- git origin: ${entry.repo.origin}`)
+            if (entry.repo?.root) lines.push(`- git root: ${entry.repo.root}`)
+            if (entry.github?.upstream || entry.github?.fork || entry.github?.prUrl) {
               lines.push(
-                `- github: upstream=${gh.upstream}${gh.fork ? ` fork=${gh.fork}` : ""}${gh.base ? ` base=${gh.base}` : ""}${gh.defaultBranch ? ` default=${gh.defaultBranch}` : ""}`,
+                `- github: host=${entry.github?.host || ""}${entry.github?.upstream ? ` upstream=${entry.github.upstream}` : ""}${entry.github?.fork ? ` fork=${entry.github.fork}` : ""}`,
               )
-              if (gh.pr?.url) lines.push(`- pr: ${gh.pr.url}`)
+              if (entry.github?.prUrl) lines.push(`- pr: ${entry.github.prUrl}`)
             }
-            if (ref.meta.publish?.time) {
-              lines.push(`- published: ${new Date(ref.meta.publish.time).toISOString()}`)
-              if (ref.meta.publish.commit) lines.push(`- commit: ${ref.meta.publish.commit}`)
-              if (ref.meta.publish.pushed) lines.push(`- pushed: ${ref.meta.publish.pushed.remote}/${ref.meta.publish.pushed.branch}`)
+            if (entry.session?.id) {
+              lines.push(`- session: ${entry.session.id}`)
+              lines.push(`Try: opencode run --session ${entry.session.id} --dir ${JSON.stringify(entry.worktree.path)}`)
+              lines.push(
+                `Task tip: from the supervisor session, call workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }, or pass task_id=${entry.session.id} when routing is ambiguous`,
+              )
+            } else {
+              lines.push(`Try: workbench { action: "open", name: ${JSON.stringify(entry.name)} }`)
+            }
+            if (sessionMatches.length > 1 && !name && !dirArg) {
+              lines.push(
+                `- note: multiple bindings matched this session context; showing the most recently updated (${entry.name}). Pass name to inspect another binding.`,
+              )
             }
             return lines.join("\n")
           }
 
-          if (args.action === "doctor") {
-            const lines: string[] = []
-            lines.push("workbench: doctor")
-
-            lines.push(`- config: ${conf0.path} (${conf0.status})`)
-
-            const git = Bun.which("git")
-            const gh = Bun.which("gh")
-            const rsync = Bun.which("rsync")
-            const tar = Bun.which("tar")
-            lines.push(`- tools: git=${git ? "ok" : "missing"} gh=${gh ? "ok" : "missing"} rsync=${rsync ? "ok" : "missing"} tar=${tar ? "ok" : "missing"}`)
-
-            const root = await ensureGit(ctx).catch((err) => {
-              const msg = err instanceof Error ? err.message : String(err)
-              lines.push(`- git: ${msg}`)
-              return ""
-            })
-            if (!root) return lines.join("\n")
-            lines.push(`- repo: ${root}`)
-
-            const b = await gitBranch(ctx, root).catch(() => "")
-            if (b) lines.push(`- branch: ${b}`)
-
-            const remotes = await ctx.$`git -C ${root} remote -v`.nothrow().quiet()
-            if (remotes.exitCode === 0) {
-              const text = String(remotes.text()).trim()
-              if (text) lines.push(`- remotes:\n${text}`)
+          if (args.action === "remove") {
+            const name = (args.name ?? "").trim()
+            if (!name) {
+              const current = await resolveCurrentBinding(base, ctx, toolCtx, parentSessionId, childSessionId)
+              if (!current) return "workbench: no binding for this session"
+              const removed = await removeEntryFile(current.file)
+              if (!removed) throw new Error(`workbench: failed to remove binding ${JSON.stringify(current.entry.name)}`)
+              return `workbench: removed ${current.entry.name}`
             }
 
-            if (gh) {
-              const host = (opt0.ghHost ?? "github.com").trim() || "github.com"
-              const auth = await ctx.$.cwd(root)`gh auth status -h ${host}`.env({ GH_HOST: host }).nothrow().quiet()
-              lines.push(`- gh auth (${host}): ${auth.exitCode === 0 ? "ok" : "missing"}`)
-              const info = await ghRepoInfo(ctx, root, host, opt0.repo).catch(() => null)
-              if (info?.nameWithOwner) lines.push(`- gh repo: ${info.nameWithOwner}${info.isFork ? " (fork)" : ""}`)
-            }
-
-            return lines.join("\n")
+            const dir = (args.dir ?? "").trim()
+            const hit = await resolveBindingByName(base, ctx, toolCtx, name, dir, parentSessionId, childSessionId)
+            if (!hit) return `workbench: binding not found: ${name}`
+            const removed = await removeEntryFile(hit.file)
+            if (!removed) throw new Error(`workbench: failed to remove binding ${JSON.stringify(hit.entry.name)}`)
+            return `workbench: removed ${hit.entry.name}`
           }
 
-          if (args.action === "preview") {
-            const ref = await resolveSandbox(ctx, args.sandbox ?? "")
-            const conf = await loadConfig(path.resolve(ref.meta.project.worktree))
-            const opt = { ...conf.config, ...args } as any
-            const dst = (args.targetWorktree ?? ref.meta.source.worktree).trim()
-            if (!dst) throw new Error("workbench: targetWorktree is required")
+          if (args.action === "bind" || args.action === "open") {
+            const nameArg = (args.name ?? "").trim()
+            const dirArg = (args.dir ?? "").trim()
 
-            const expected = await gitCommon(ctx, ref.meta.project.worktree)
-            const actual = await gitCommon(ctx, dst)
-            if (expected !== actual) {
-              throw new Error("workbench: targetWorktree belongs to a different git repository")
+            const defaultCwd = path.resolve(String(toolCtx?.directory || ctx.directory || "").trim() || process.cwd())
+
+            const formatBound = (saved: Entry) =>
+              [
+                "workbench: bound",
+                `- name: ${saved.name}`,
+                `- dir: ${saved.worktree.path}`,
+                ...(saved.worktree.branch ? [`- branch: ${saved.worktree.branch}`] : []),
+              ].join("\n")
+
+            const patchExisting = async (file: string, existing: Entry) => {
+              const branchInput = (args.branch ?? "").trim()
+              const github = mergeGithubMetadata(
+                existing.github,
+                {
+                  ghHost: args.ghHost,
+                  upstream: args.upstream,
+                  fork: args.fork,
+                  prUrl: args.prUrl,
+                },
+                clearSet,
+              )
+              return await writeEntry(file, {
+                ...existing,
+                worktree: {
+                  ...existing.worktree,
+                  ...(branchInput ? { branch: branchInput } : {}),
+                },
+                github,
+                time: existing.time,
+              })
             }
 
-            const delFlag = opt.delete === true
-            const dirty = opt.allowDirty === true
-            if (delFlag && !dirty) {
-              const before = await gitPorcelain(ctx, dst)
-              if (before) {
-                throw new Error(
-                  "workbench: targetWorktree is not clean; commit/stash changes before preview with delete=true (or set allowDirty=true)",
-                )
-              }
-            }
+            const openFrom = async (file: string, saved: Entry) => {
+              const repo = await detectRepo(ctx, saved.worktree.path)
+              const commonDir = requireGitRepo(repo.commonDir || saved.repo?.commonDir || "", saved.worktree.path)
+              const entry = await syncEntryRepo(file, saved, toRepoMeta({ commonDir, origin: repo.origin, root: repo.root }))
 
-            const copy = rule(opt, ref.meta)
-            const plan = await planFiles(ctx, ref.meta.sandbox.path, dst, copy.exclude, { delete: delFlag })
-
-            let add = 0
-            let mod = 0
-            let del = 0
-            const shown: string[] = []
-            for (const line of plan) {
-              if (line.startsWith("*deleting")) {
-                del++
-                shown.push(line)
-                continue
-              }
-              const m = line.match(/^(\S+)\s+(.*)$/)
-              if (!m) {
-                mod++
-                shown.push(line)
-                continue
-              }
-              const code = m[1]
-              const name = m[2]
-              if (code?.[1] === "d" || name === "./" || name.endsWith("/")) continue
-              if (code.includes("+++++++++")) add++
-              else mod++
-              shown.push(line)
-            }
-
-            const limit = Math.max(0, Number(opt.previewLines ?? 200))
-            const output = shown.slice(0, limit)
-
-            return [
-              `workbench: preview`,
-              `- sandbox: ${ref.meta.sandbox.path}`,
-              `- target: ${dst}`,
-              `- delete: ${delFlag}`,
-              `- changes: add=${add} modify=${mod} delete=${del}`,
-              ...(output.length ? ["", ...output] : []),
-              ...(shown.length > limit ? ["", `... truncated (${shown.length - limit} more lines)`] : []),
-            ].join("\n")
-          }
-
-          if (args.action === "checkpoint") {
-            const ref = await resolveSandbox(ctx, args.sandbox ?? "")
-            const conf = await loadConfig(path.resolve(ref.meta.project.worktree))
-            const opt = { ...conf.config, ...args } as any
-            const r = await roots(ctx)
-            if (!isInside(r.sandboxes, ref.dir)) {
-              throw new Error("workbench: checkpoint only supports managed sandboxes")
-            }
-
-            const base = path.dirname(ref.dir)
-            const name = clean(args.name ?? `${ref.meta.name}-checkpoint-${Math.floor(Date.now() / 1000)}`) || `checkpoint-${Date.now()}`
-            const dst = path.join(base, name)
-            const existing = await readdir(dst).catch(() => null)
-            if (existing) throw new Error(`workbench: checkpoint destination exists: ${name}`)
-            await ensureDir(dst)
-
-            const copy = rule(opt, ref.meta)
-            await syncFiles(ctx, ref.meta.sandbox.path, dst, r.tmp, copy.exclude)
-
-            const id = randomBytes(8).toString("hex")
-            await writeMeta(dst, {
-              version: 1,
-              id,
-              name,
-              branch: ref.meta.branch,
-              copy: {
-                mode: ref.meta.copy?.mode ?? "archive",
-                excludeMode: copy.mode,
-                exclude: copy.exclude,
-              },
-              github: ref.meta.github,
-              project: ref.meta.project,
-              source: ref.meta.source,
-              sandbox: {
-                path: dst,
-              },
-              time: {
-                created: Date.now(),
-                updated: Date.now(),
-              },
-            })
-
-            return [
-              `workbench: checkpoint created`,
-              `- from: ${ref.meta.sandbox.path}`,
-              `- to: ${dst}`,
-              `- name: ${name}`,
-            ].join("\n")
-          }
-
-          if (args.action === "reset") {
-            const ref = await resolveSandbox(ctx, args.sandbox ?? "")
-            const conf = await loadConfig(path.resolve(ref.meta.project.worktree))
-            const opt = { ...conf.config, ...args } as any
-            const src = path.resolve(args.sourceWorktree ?? ref.meta.source.worktree)
-            const dst = ref.meta.sandbox.path
-
-            const expected = await gitCommon(ctx, ref.meta.project.worktree)
-            const actual = await gitCommon(ctx, src)
-            if (expected !== actual) {
-              throw new Error("workbench: sourceWorktree belongs to a different git repository")
-            }
-
-            const file = path.join(r.locks, clean(ref.meta.project.id), lockname(dst) + ".lock")
-            return await withLock(
-              file,
-              {
-                timeoutMs: Math.max(0, Number(opt.lockTimeout ?? 3600)) * 1000,
-                force: args.force === true,
-                info: { action: "reset", sandbox: ref.meta.name, path: dst },
-              },
-              async () => {
-                const mode = (opt.copyMode ?? ref.meta.copy?.mode ?? "archive") as "archive" | "worktree"
-                const copy = rule(opt, ref.meta)
-                const backup = opt.resetBackup !== false
-                const del = opt.resetDelete !== false
-                if (backup) {
-                  const base = path.dirname(ref.dir)
-                  const name = clean(`${ref.meta.name}-backup-${Math.floor(Date.now() / 1000)}`) || `backup-${Date.now()}`
-                  const backup = path.join(base, name)
-                  await ensureDir(backup)
-                  await syncFiles(ctx, dst, backup, r.tmp, copy.exclude)
-                  await writeMeta(backup, {
-                    ...ref.meta,
-                    id: randomBytes(8).toString("hex"),
-                    name,
-                    sandbox: { path: backup },
-                    session: undefined,
-                    publish: undefined,
-                    time: { created: Date.now(), updated: Date.now() },
-                  })
-                }
-
-                if (mode === "worktree") {
-                  await syncFiles(ctx, src, dst, r.tmp, copy.exclude, { delete: del })
-                } else {
-                  const tmp = path.join(r.tmp, `reset-${Date.now()}-${randomBytes(4).toString("hex")}`)
-                  await rm(tmp, { recursive: true, force: true }).catch(() => {})
-                  await ensureDir(tmp)
-                  await archive(ctx, src, tmp, r.tmp)
-                  await syncFiles(ctx, tmp, dst, r.tmp, copy.exclude, { delete: del })
-                  await rm(tmp, { recursive: true, force: true }).catch(() => {})
-                }
-
-                await writeMeta(ref.dir, {
-                  ...ref.meta,
-                  copy: {
-                    mode,
-                    excludeMode: copy.mode,
-                    exclude: copy.exclude,
-                  },
-                  time: ref.meta.time,
-                })
-
+              const parent = parentSessionId
+              if (entry.session?.id && args.force !== true && (!parent || entry.session.parent === parent)) {
                 return [
-                  `workbench: reset`,
-                  `- sandbox: ${dst}`,
-                  `- source: ${src}`,
-                  `- mode: ${mode}`,
-                  `- delete: ${del}`,
-                  ...(backup ? [`- backup: created`] : []),
+                  "workbench: already opened",
+                  `- name: ${entry.name}`,
+                  `- dir: ${entry.worktree.path}`,
+                  `- session: ${entry.session.id}`,
+                  `Try: opencode run --session ${entry.session.id} --dir ${JSON.stringify(entry.worktree.path)}`,
+                  'Task tip: run workbench { action: "task", dir: ".workbench/<name>", prompt: "..." } from the supervisor session',
                 ].join("\n")
-              },
-            )
-          }
+              }
 
-          if (args.action === "rename") {
-            const ref = await resolveSandbox(ctx, args.sandbox ?? "")
-            const to = clean(args.renameTo ?? "")
-            if (!to) throw new Error("workbench: renameTo is required")
-            if (ref.meta.session?.id && !args.force) {
-              throw new Error("workbench: sandbox has a session; use force=true to rename")
-            }
+              const title = (args.title ?? "").trim() || `WB: ${entry.worktree.branch || entry.name}`
+              const created = await ctx.client.session.create({
+                query: { directory: entry.worktree.path },
+                body: {
+                  ...(parent ? { parentID: parent } : {}),
+                  title,
+                },
+              })
+              const session = unwrap<any>(created)
+              if (!session?.id) throw new Error("workbench: failed to create session")
 
-            const r = await roots(ctx)
-            if (!isInside(r.sandboxes, ref.dir)) {
-              throw new Error("workbench: rename only supports managed sandboxes")
-            }
+              const updated = await writeEntry(file, {
+                ...entry,
+                session: {
+                  id: session.id,
+                  ...(parent ? { parent } : {}),
+                  title,
+                },
+                time: entry.time,
+              })
 
-            const next = path.join(path.dirname(ref.dir), to)
-            const exists = await readdir(next).catch(() => null)
-            if (exists) throw new Error("workbench: rename target already exists")
+              if ((args.prompt ?? "").trim()) {
+                await ctx.client.session.promptAsync({
+                  path: { id: session.id },
+                  query: { directory: updated.worktree.path },
+                  body: { parts: [{ type: "text", text: args.prompt!.trim() }] },
+                })
+              }
 
-            await rename(ref.dir, next)
-            await writeMeta(next, {
-              ...ref.meta,
-              name: to,
-              sandbox: {
-                path: next,
-              },
-              time: ref.meta.time,
-            })
-
-            return [
-              `workbench: renamed`,
-              `- from: ${ref.dir}`,
-              `- to: ${next}`,
-              ...(ref.meta.session?.id ? [`Note: session directory is not updated; run with --dir ${JSON.stringify(next)}`] : []),
-            ].join("\n")
-          }
-
-          if (args.action === "gc") {
-            const keep = opt0.gcKeepWithSession !== false
-            const days = Math.max(0, Number(opt0.gcDays ?? 30))
-            const cutoff = Date.now() - days * 24 * 60 * 60 * 1000
-            const items = await allSandboxes(r.base)
-            const candidates = await Promise.all(
-              items.map(async (item) => {
-                const exists = await Bun.file(item.meta.source.worktree).exists().catch(() => false)
-                const missing = !exists
-                const old = item.meta.time.updated < cutoff
-                const hasSession = !!item.meta.session?.id
-                if (keep && hasSession) return null
-                if (!old && !missing) return null
-                const reason = [old ? `age>${days}d` : "", missing ? "missing-source" : ""].filter(Boolean).join(",")
-                return { ...item, reason }
-              }),
-            )
-              .then((x) => x.filter((y): y is NonNullable<typeof y> => !!y))
-
-            if (!(args.gcApply === true)) {
               return [
-                `workbench: gc (dry-run)`,
-                `- days: ${days}`,
-                `- candidates: ${candidates.length}`,
-                ...candidates.slice(0, 50).map((x) => `- ${x.meta.name} (${x.reason}) ${x.meta.sandbox.path}`),
-                ...(candidates.length > 50 ? [`... truncated (${candidates.length - 50} more)`] : []),
+                "workbench: opened",
+                `- name: ${updated.name}`,
+                `- dir: ${updated.worktree.path}`,
+                ...(updated.worktree.branch ? [`- branch: ${updated.worktree.branch}`] : []),
+                `- session: ${session.id}`,
+                `Try: opencode run --session ${session.id} --dir ${JSON.stringify(updated.worktree.path)}`,
+                'Task tip: run workbench { action: "task", dir: ".workbench/<name>", prompt: "..." } from the supervisor session',
               ].join("\n")
             }
 
-            let removed = 0
-            for (const item of candidates) {
-              if (!isInside(r.sandboxes, item.dir)) continue
-              await rm(item.dir, { recursive: true, force: true }).catch(() => {})
-              removed++
+            const bindOrOpenExisting = async (file: string, existing: Entry) => {
+              const repo = await detectRepo(ctx, existing.worktree.path)
+              const commonDir = requireGitRepo(repo.commonDir || existing.repo?.commonDir || "", existing.worktree.path)
+              const scoped = await syncEntryRepo(
+                file,
+                existing,
+                toRepoMeta({ commonDir, origin: repo.origin, root: repo.root }),
+              )
+              const saved = await patchExisting(file, scoped)
+              if (args.action === "bind") return formatBound(saved)
+              return await openFrom(file, saved)
             }
 
-            return [
-              `workbench: gc`,
-              `- days: ${days}`,
-              `- removed: ${removed}`,
-            ].join("\n")
-          }
-
-          if (args.action === "create") {
-            const root = await ensureGit(ctx)
-
-            const opt = opt0
-            const host = (opt.ghHost ?? "github.com").trim() || "github.com"
-            const upstreamRemote = (opt.upstreamRemote ?? "upstream").trim() || "upstream"
-            const forkRemote = (opt.forkRemote ?? "fork").trim() || "fork"
-            const protocol = (opt.protocol ?? "auto") as "auto" | "ssh" | "https"
-            const fetch = opt.fetch !== false
-            const github = opt.github === true
-            const wantPr = opt.pr === true
-            const wantPush = opt.push === true
-
-            if (github && upstreamRemote === forkRemote) {
-              throw new Error("workbench: upstreamRemote and forkRemote must be different")
-            }
-
-            if (wantPr && !github) {
-              throw new Error("workbench: pr=true requires github=true")
-            }
-
-            const gh = github
-              ? await prepareGithub(
-                  ctx,
-                  root,
-                  {
-                    host,
-                    repo: opt.repo,
-                    fork: opt.fork,
-                    protocol,
-                    upstreamRemote,
-                    forkRemote,
-                    fetch,
-                  },
-                  log,
-                )
-              : null
-
-            const b = (
-                  args.branch ??
-                  (args.sourceWorktree
-                    ? await (async () => {
-                    const src = path.resolve(args.sourceWorktree!)
-                    const head = await ctx.$`git -C ${src} rev-parse --abbrev-ref HEAD`.nothrow().quiet()
-                    const name = head.exitCode === 0 ? head.text().trim() : ""
-                    if (name && name !== "HEAD") return name
-                    return branch(ctx, root)
-                  })()
-                : await branch(ctx, root))
-            ).trim()
-            if (!b) throw new Error("workbench: branch is required")
-
-            const base = (() => {
-              const base = (opt.base ?? "auto").trim()
-              if (!gh) return base
-              if (!base || base === "auto") return gh.defaultBranch
-              if (base.startsWith(gh.remotes.upstream + "/")) return base.slice(gh.remotes.upstream.length + 1)
-              return base
-            })()
-
-            const proj = clean(ctx.project.id)
-            const wname = `${key(b)}-${hash(b)}`
-            const local = await gitHas(ctx, root, `refs/heads/${b}`)
-            const from = await (async () => {
-              if (args.from) return args.from
-              if (!gh) {
-                const base = (opt.base ?? "auto").trim()
-                if (base && base !== "auto") return base
-                return undefined
-              }
-              if (local) return undefined
-
-              const forkRef = `refs/remotes/${gh.remotes.fork}/${b}`
-              if (await gitHas(ctx, root, forkRef)) return `${gh.remotes.fork}/${b}`
-
-              const upstreamRef = `refs/remotes/${gh.remotes.upstream}/${b}`
-              if (await gitHas(ctx, root, upstreamRef)) return `${gh.remotes.upstream}/${b}`
-
-              const base = (() => {
-                const input = (opt.base ?? "auto").trim()
-                if (!input || input === "auto") return gh.defaultBranch
-                if (input.startsWith(gh.remotes.upstream + "/")) return input.slice(gh.remotes.upstream.length + 1)
-                return input
-              })()
-              return `${gh.remotes.upstream}/${base}`
-            })()
-            const wdir = (args.sourceWorktree ?? "").trim()
-              ? path.resolve(args.sourceWorktree!)
-              : await makeWorktree(ctx, root, path.join(r.worktrees, proj, wname), b, from)
-
-            const copy = rule(opt)
-            const exclude = copy.exclude
-
-            if (!local && from && gh && (from === `${gh.remotes.fork}/${b}` || from === `${gh.remotes.upstream}/${b}`)) {
-              const res = await ctx.$`git -C ${wdir} branch --set-upstream-to=${from} ${b}`.nothrow().quiet()
-              if (res.exitCode !== 0) {
-                await log("warn", "failed to set upstream tracking", {
-                  branch: b,
-                  upstream: from,
-                  stderr: res.stderr.toString(),
-                })
+            // Default to the current session binding if neither name nor dir is provided.
+            if (!nameArg && !dirArg) {
+              const current = await resolveCurrentBinding(base, ctx, toolCtx, parentSessionId, childSessionId)
+              if (current) {
+                return await bindOrOpenExisting(current.file, current.entry)
               }
             }
 
-            const name = clean(args.name ?? `${wname}-${Math.floor(Date.now() / 1000)}`) || `sandbox-${Date.now()}`
-            const sdir = path.join(r.sandboxes, proj, name)
-            const existing = await readdir(sdir).catch(() => null)
-            if (existing && existing.length) {
-              const hasMeta = await Bun.file(path.join(sdir, META)).exists().catch(() => false)
-              if (hasMeta) throw new Error(`workbench: sandbox already exists: ${name}`)
-              throw new Error(`workbench: sandbox directory is not empty: ${sdir}`)
-            }
-            await ensureDir(sdir)
-
-            const mode = (opt.copyMode ?? "archive") as "archive" | "worktree"
-            if (mode === "worktree") {
-              await syncFiles(ctx, wdir, sdir, r.tmp, exclude)
-            } else {
-              await archive(ctx, wdir, sdir, r.tmp)
-            }
-
-            const needPush = Boolean(gh && (wantPush || wantPr))
-            if (needPush && gh) {
-              const res = await ctx.$`git -C ${wdir} push -u ${gh.remotes.fork} ${b}`.nothrow()
-              if (res.exitCode !== 0) {
-                throw new Error(`workbench: git push failed: ${res.stderr.toString() || res.stdout.toString()}`)
+            // Name-only operations update/open an existing binding without changing its directory.
+            if (!dirArg && nameArg) {
+              const existing = await resolveBindingByName(base, ctx, toolCtx, nameArg, "", parentSessionId, childSessionId)
+              if (!existing) {
+                throw new Error(`workbench: binding not found: ${nameArg} (pass dir to create it, or create/open from a git repo directory)`)
               }
+
+              return await bindOrOpenExisting(existing.file, existing.entry)
             }
 
-            const id = randomBytes(8).toString("hex")
-            const meta: Meta = {
+            // Dir-based operations create/update a binding for that directory.
+            const input = (dirArg || defaultCwd).trim() || defaultCwd
+            const top = await gitTopLevel(ctx, defaultCwd)
+            const rel = input.replace(/^\.\//, "")
+            if (!top && (rel === ".workbench" || rel.startsWith(".workbench/"))) {
+              throw new Error(
+                "workbench: .workbench paths must be resolved from inside a git repo; pass dir as <repo>/.workbench/<name> or use an absolute path",
+              )
+            }
+            const root = top || defaultCwd
+            const dir = path.isAbsolute(input) ? path.resolve(input) : path.resolve(root, input)
+            const st = await stat(dir).catch(() => null)
+            if (!st || !st.isDirectory()) throw new Error(`workbench: dir not found: ${dir}`)
+
+            const repo = await detectRepo(ctx, dir)
+            const commonDir = requireGitRepo(repo.commonDir, dir)
+            const repoMeta = toRepoMeta({ commonDir, origin: repo.origin, root: repo.root })
+            const branch = (args.branch ?? "").trim() || (await gitBranch(ctx, dir))
+            const existingByDir = await resolveEntryByDir(base, dir)
+            if (existingByDir) {
+              const scopedExisting = await syncEntryRepo(existingByDir.file, existingByDir.entry, repoMeta)
+              const mergedName = (nameArg || scopedExisting.name || branch || path.basename(dir)).trim()
+              if (!mergedName) throw new Error("workbench: name is required")
+              const mergedBranch = branch || scopedExisting.worktree.branch || ""
+              const github = mergeGithubMetadata(
+                scopedExisting.github,
+                {
+                  ghHost: args.ghHost,
+                  upstream: args.upstream,
+                  fork: args.fork,
+                  prUrl: args.prUrl,
+                },
+                clearSet,
+              )
+              const merged = await writeEntry(existingByDir.file, {
+                ...scopedExisting,
+                name: clean(mergedName) || mergedName,
+                worktree: {
+                  path: dir,
+                  ...(mergedBranch ? { branch: mergedBranch } : {}),
+                },
+                repo: repoMeta,
+                github,
+                time: scopedExisting.time,
+              })
+              await dedupeDirEntries(base, dir, existingByDir.file)
+              if (args.action === "bind") return formatBound(merged)
+              return await openFrom(existingByDir.file, merged)
+            }
+
+            const name = (nameArg || branch || path.basename(dir)).trim()
+            if (!name) throw new Error("workbench: name is required")
+
+            const group = repoGroup(commonDir, dir).group
+            const file = entryPath(base, group, name)
+            const existing = await readEntry(file)
+            if (existing && path.resolve(existing.worktree.path) !== dir) {
+              throw new Error(
+                `workbench: binding name already exists (${existing.name}) for ${JSON.stringify(existing.worktree.path)}. Use another name or reuse the existing dir binding.`,
+              )
+            }
+            const scopedExisting = existing ? await syncEntryRepo(file, existing, repoMeta) : null
+
+            const now = Date.now()
+            const next: Entry = {
               version: 1,
-              id,
-              name,
-              branch: b,
-              copy: {
-                mode,
-                excludeMode: copy.mode,
-                exclude,
+              id: scopedExisting?.id ?? randomBytes(8).toString("hex"),
+              name: clean(name) || name,
+              worktree: {
+                path: dir,
+                ...(branch ? { branch } : {}),
               },
-              github: gh
-                ? {
-                    host,
-                    upstream: gh.upstream,
-                    fork: gh.fork,
-                    protocol: gh.protocol,
-                    defaultBranch: gh.defaultBranch,
-                    base,
-                    remotes: gh.remotes,
-                  }
-                : undefined,
-              project: {
-                id: ctx.project.id,
-                worktree: root,
-              },
-              source: {
-                worktree: wdir,
-              },
-              sandbox: {
-                path: sdir,
-              },
+              repo: repoMeta,
+              github: mergeGithubMetadata(
+                scopedExisting?.github,
+                {
+                  ghHost: args.ghHost,
+                  upstream: args.upstream,
+                  fork: args.fork,
+                  prUrl: args.prUrl,
+                },
+                clearSet,
+              ),
+              session: scopedExisting?.session,
               time: {
-                created: Date.now(),
-                updated: Date.now(),
+                created: scopedExisting?.time?.created ?? now,
+                updated: now,
               },
             }
 
-            const title = (args.title ?? "").trim() || `WB: ${b}`
-            const created = await ctx.client.session.create({
-              query: { directory: sdir },
-              body: {
-                parentID: toolCtx.sessionID,
-                title,
-              },
-            })
-            const session = unwrap<any>(created)
-            if (!session?.id) throw new Error("workbench: failed to create session")
+            const saved = await writeEntry(file, next)
+            await dedupeDirEntries(base, dir, file)
 
-            const next = await writeMeta(sdir, {
-              ...meta,
-              session: {
-                id: session.id,
-                parent: toolCtx.sessionID,
-              },
-            })
-
-            const pr = await (async () => {
-              if (!wantPr || !gh) return ""
-              const upstream = gh.upstream
-              const forkOwner = gh.fork.split("/")[0] ?? ""
-              if (!forkOwner) throw new Error("workbench: failed to resolve fork owner")
-
-              const base = (() => {
-                const explicit = (opt.prBase ?? "auto").trim()
-                if (explicit && explicit !== "auto") return explicit.startsWith(gh.remotes.upstream + "/") ? explicit.slice(gh.remotes.upstream.length + 1) : explicit
-                const base = (opt.base ?? "auto").trim()
-                if (base && base !== "auto") return base.startsWith(gh.remotes.upstream + "/") ? base.slice(gh.remotes.upstream.length + 1) : base
-                return gh.defaultBranch
-              })()
-
-              const pr = {
-                title: opt.prTitle,
-                body: opt.prBody,
-                labels: opt.prLabels ?? [],
-                reviewers: opt.prReviewers ?? [],
-                assignees: opt.prAssignees ?? [],
-                projects: opt.prProjects ?? [],
-                milestone: opt.prMilestone,
-                noMaintainerEdit: opt.prNoMaintainerEdit === true,
-              }
-
-              const head = `${forkOwner}:${b}`
-              const existing = await prUrl(ctx, root, host, upstream, head)
-              if (existing) {
-                const baseEdit = (() => {
-                  const explicit = (opt.prBase ?? "auto").trim()
-                  if (explicit && explicit !== "auto") return base
-                  return undefined
-                })()
-                await prEdit(ctx, root, host, upstream, existing, {
-                  base: baseEdit,
-                  title: pr.title,
-                  body: pr.body,
-                  labels: pr.labels,
-                  reviewers: pr.reviewers,
-                  assignees: pr.assignees,
-                  projects: pr.projects,
-                  milestone: pr.milestone,
-                }).catch(async (err) => {
-                  await log("warn", "failed to edit existing PR", {
-                    pr: existing,
-                    error: err instanceof Error ? err.message : String(err),
-                  })
-                })
-                return existing
-              }
-
-              const title = pr.title || b
-              const body = pr.body ?? ""
-              const url = await prCreate(ctx, root, host, upstream, {
-                head,
-                base,
-                title,
-                body,
-                draft: opt.draft === true,
-                labels: pr.labels,
-                reviewers: pr.reviewers,
-                assignees: pr.assignees,
-                projects: pr.projects,
-                milestone: pr.milestone,
-                noMaintainerEdit: pr.noMaintainerEdit,
-              })
-              return url
-            })().catch(async (err) => {
-              await log("warn", "failed to create PR", {
-                error: err instanceof Error ? err.message : String(err),
-                branch: b,
-              })
-              return ""
-            })
-
-            if (pr && gh) {
-              await writeMeta(sdir, {
-                ...next,
-                github: {
-                  ...(next.github ?? {
-                    host,
-                    upstream: gh.upstream,
-                    fork: gh.fork,
-                    protocol: gh.protocol,
-                    defaultBranch: gh.defaultBranch,
-                    base,
-                    remotes: gh.remotes,
-                  }),
-                  pr: {
-                    url: pr,
-                  },
-                },
-              })
-            }
-
-            if ((args.prompt ?? "").trim()) {
-              await ctx.client.session.promptAsync({
-                path: { id: session.id },
-                query: { directory: sdir },
-                body: {
-                  parts: [{ type: "text", text: args.prompt!.trim() }],
-                },
-              })
-            }
-
-            await log("info", "sandbox created", {
-              sessionID: next.session?.id,
-              sandbox: sdir,
-              source: wdir,
-              branch: b,
-            })
-
-            return [
-              `workbench: created`,
-              `- branch: ${b}`,
-              `- source worktree: ${wdir}`,
-              `- sandbox: ${sdir}`,
-              `- session: ${session.id}`,
-              ...(pr ? [`- pr: ${pr}`] : []),
-              `Try: opencode run --session ${session.id} --dir ${JSON.stringify(sdir)}`,
-            ].join("\n")
-          }
-
-          if (args.action === "open") {
-            const ref = await resolveSandbox(ctx, args.sandbox ?? "")
-            if (ref.meta.session?.id) return `workbench: already opened session=${ref.meta.session.id}`
-
-            const title = (args.title ?? "").trim() || `WB: ${ref.meta.branch ?? ref.meta.name}`
-            const created = await ctx.client.session.create({
-              query: { directory: ref.meta.sandbox.path },
-              body: {
-                parentID: toolCtx.sessionID,
-                title,
-              },
-            })
-            const session = unwrap<any>(created)
-            if (!session?.id) throw new Error("workbench: failed to create session")
-
-            await writeMeta(ref.dir, {
-              ...ref.meta,
-              session: {
-                id: session.id,
-                parent: toolCtx.sessionID,
-              },
-            })
-            return [
-              `workbench: opened`,
-              `- sandbox: ${ref.meta.sandbox.path}`,
-              `- session: ${session.id}`,
-              `Try: opencode run --session ${session.id} --dir ${JSON.stringify(ref.meta.sandbox.path)}`,
-            ].join("\n")
-          }
-
-          if (args.action === "sync") {
-            const ref = await resolveSandbox(ctx, args.sandbox ?? "")
-            const conf = await loadConfig(path.resolve(ref.meta.project.worktree))
-            const opt = { ...conf.config, ...args } as any
-            const dst = (args.targetWorktree ?? ref.meta.source.worktree).trim()
-            if (!dst) throw new Error("workbench: targetWorktree is required")
-
-            const expected = await gitCommon(ctx, ref.meta.project.worktree)
-            const actual = await gitCommon(ctx, dst)
-            if (expected !== actual) {
-              throw new Error("workbench: targetWorktree belongs to a different git repository")
-            }
-
-            const del = opt.delete === true
-            const dirty = opt.allowDirty === true
-
-            const file = path.join(r.locks, clean(ref.meta.project.id), lockname(dst) + ".lock")
-            return await withLock(
-              file,
-              {
-                timeoutMs: Math.max(0, Number(opt.lockTimeout ?? 3600)) * 1000,
-                force: args.force === true,
-                info: { action: "sync", sandbox: ref.meta.name, target: dst, delete: del },
-              },
-              async () => {
-                if (del && !dirty) {
-                  const before = await gitPorcelain(ctx, dst)
-                  if (before) {
-                    throw new Error(
-                      "workbench: targetWorktree is not clean; commit/stash changes before sync with delete=true (or set allowDirty=true)",
-                    )
-                  }
-                }
-
-                const copy = rule(opt, ref.meta)
-                await syncFiles(ctx, ref.meta.sandbox.path, dst, r.tmp, copy.exclude, { delete: del })
-                await writeMeta(ref.dir, {
-                  ...ref.meta,
-                  time: ref.meta.time,
-                })
-                await log("info", "sandbox synced", {
-                  sandbox: ref.meta.sandbox.path,
-                  target: dst,
-                  name: ref.meta.name,
-                })
-                return [
-                  `workbench: synced`,
-                  `- sandbox: ${ref.meta.sandbox.path}`,
-                  `- target: ${dst}`,
-                  `- delete: ${del}`,
-                  `Note: use git to review changes in target.`,
-                ].join("\n")
-              },
-            )
-          }
-
-          if (args.action === "publish") {
-            const ref = await resolveSandbox(ctx, args.sandbox ?? "")
-            const conf = await loadConfig(path.resolve(ref.meta.project.worktree))
-            const opt = { ...conf.config, ...args } as any
-            const dst = (args.targetWorktree ?? ref.meta.source.worktree).trim()
-            if (!dst) throw new Error("workbench: targetWorktree is required")
-
-            const expected = await gitCommon(ctx, ref.meta.project.worktree)
-            const actual = await gitCommon(ctx, dst)
-            if (expected !== actual) {
-              throw new Error("workbench: targetWorktree belongs to a different git repository")
-            }
-
-            const current = await gitBranch(ctx, dst)
-            if (!current || current === "HEAD") {
-              throw new Error("workbench: targetWorktree is not on a branch")
-            }
-            if (ref.meta.branch && current !== ref.meta.branch) {
-              throw new Error(`workbench: targetWorktree is on '${current}', expected '${ref.meta.branch}'`)
-            }
-            const b = (ref.meta.branch ?? current).trim()
-            if (!b) throw new Error("workbench: branch not resolved")
-
-            const host = (ref.meta.github?.host ?? opt.ghHost ?? "github.com").trim() || "github.com"
-            const del = opt.delete === true
-            const dirty = opt.allowDirty === true
-
-            const file = path.join(r.locks, clean(ref.meta.project.id), lockname(dst) + ".lock")
-            return await withLock(
-              file,
-              {
-                timeoutMs: Math.max(0, Number(opt.lockTimeout ?? 3600)) * 1000,
-                force: args.force === true,
-                info: { action: "publish", sandbox: ref.meta.name, target: dst, branch: b, delete: del },
-              },
-              async () => {
-                if (!dirty) {
-                  const before = await gitPorcelain(ctx, dst)
-                  if (before) {
-                    throw new Error(
-                      "workbench: targetWorktree is not clean; commit/stash changes before publish (or set allowDirty=true)",
-                    )
-                  }
-                }
-
-                const copy = rule(opt, ref.meta)
-                await syncFiles(ctx, ref.meta.sandbox.path, dst, r.tmp, copy.exclude, { delete: del })
-
-                const after = await gitPorcelain(ctx, dst)
-                if (!after) {
-                  await writeMeta(ref.dir, { ...ref.meta, time: ref.meta.time })
-                  return [
-                    `workbench: publish (no changes)`,
-                    `- branch: ${b}`,
-                    `- sandbox: ${ref.meta.sandbox.path}`,
-                    `- target: ${dst}`,
-                  ].join("\n")
-                }
-
-                const wantCommit = opt.commit !== false
-                if (!wantCommit) {
-                  await writeMeta(ref.dir, { ...ref.meta, time: ref.meta.time })
-                  return [
-                    `workbench: publish (synced, not committed)`,
-                    `- branch: ${b}`,
-                    `- sandbox: ${ref.meta.sandbox.path}`,
-                    `- target: ${dst}`,
-                    `- status:`,
-                    after,
-                  ].join("\n")
-                }
-
-                await gitStage(ctx, dst, (opt.stage ?? "all") as "all" | "tracked")
-                const staged = await gitStaged(ctx, dst)
-                if (!staged) {
-                  await writeMeta(ref.dir, { ...ref.meta, time: ref.meta.time })
-                  return [
-                    `workbench: publish (no staged changes)`,
-                    `- branch: ${b}`,
-                    `- sandbox: ${ref.meta.sandbox.path}`,
-                    `- target: ${dst}`,
-                  ].join("\n")
-                }
-
-                const files = staged
-                  .split("\n")
-                  .map((x) => x.trim())
-                  .filter(Boolean)
-                const title = (opt.commitMessage ?? "").trim() || `workbench: publish ${b} (${files.length} files)`
-                const body =
-                  (opt.commitBody ?? "").trim() ||
-                  (!opt.commitBodyAuto
-                    ? ""
-                    : [
-                        `Sandbox: ${ref.meta.name}`,
-                        ...(ref.meta.session?.id ? [`Session: ${ref.meta.session.id}`] : []),
-                        "",
-                        "Files:",
-                        ...files.slice(0, 30).map((x) => `- ${x}`),
-                        ...(files.length > 30 ? [`- ...and ${files.length - 30} more`] : []),
-                      ].join("\n"))
-                await gitCommit(ctx, dst, title, {
-                  body,
-                  noVerify: opt.noVerify === true,
-                  sign: opt.sign === true,
-                })
-
-                const head = await ctx.$`git -C ${dst} rev-parse HEAD`.nothrow().quiet()
-                const sha = head.exitCode === 0 ? head.text().trim() : ""
-
-                const ghWanted = Boolean(opt.github || ref.meta.github)
-                const wantPush = opt.push === undefined ? ghWanted : opt.push === true
-                const wantPr = opt.pr === undefined ? ghWanted : opt.pr === true
-
-                const protocol = (opt.protocol ?? "auto") as "auto" | "ssh" | "https"
-                const fetch = opt.fetch !== false
-                const upstreamRemote = (ref.meta.github?.remotes?.upstream ?? opt.upstreamRemote ?? "upstream").trim() || "upstream"
-                const forkRemote = (ref.meta.github?.remotes?.fork ?? opt.forkRemote ?? "fork").trim() || "fork"
-
-                const gh = wantPush || wantPr ? (
-                  await prepareGithub(
-                    ctx,
-                    ref.meta.project.worktree,
-                    {
-                      host,
-                      repo: opt.repo ?? ref.meta.github?.upstream,
-                      fork: opt.fork ?? ref.meta.github?.fork,
-                      protocol,
-                      upstreamRemote,
-                      forkRemote,
-                      fetch,
-                    },
-                    log,
-                  )
-                ) : null
-
-                if (wantPush && gh) {
-                  await gitPush(ctx, dst, gh.remotes.fork, b)
-                }
-
-                const pr = await (async () => {
-                  if (!wantPr || !gh) return ""
-                  const upstream = gh.upstream
-                  const forkOwner = gh.fork.split("/")[0] ?? ""
-                  if (!forkOwner) throw new Error("workbench: failed to resolve fork owner")
-
-                  const base = (() => {
-                    const explicit = (opt.prBase ?? "auto").trim()
-                    if (explicit && explicit !== "auto")
-                      return explicit.startsWith(gh.remotes.upstream + "/")
-                        ? explicit.slice(gh.remotes.upstream.length + 1)
-                        : explicit
-                    const base = (opt.base ?? "auto").trim()
-                    if (base && base !== "auto")
-                      return base.startsWith(gh.remotes.upstream + "/") ? base.slice(gh.remotes.upstream.length + 1) : base
-                    return gh.defaultBranch
-                  })()
-
-                  const prMeta = {
-                    title: opt.prTitle,
-                    body: opt.prBody,
-                    labels: opt.prLabels ?? [],
-                    reviewers: opt.prReviewers ?? [],
-                    assignees: opt.prAssignees ?? [],
-                    projects: opt.prProjects ?? [],
-                    milestone: opt.prMilestone,
-                    noMaintainerEdit: opt.prNoMaintainerEdit === true,
-                  }
-
-                  const head = `${forkOwner}:${b}`
-                  const existing = await prUrl(ctx, ref.meta.project.worktree, host, upstream, head)
-                  if (existing) {
-                    await prEdit(ctx, ref.meta.project.worktree, host, upstream, existing, {
-                      title: prMeta.title,
-                      body: prMeta.body,
-                      labels: prMeta.labels,
-                      reviewers: prMeta.reviewers,
-                      assignees: prMeta.assignees,
-                      projects: prMeta.projects,
-                      milestone: prMeta.milestone,
-                    }).catch(async (err) => {
-                      await log("warn", "failed to edit existing PR", {
-                        pr: existing,
-                        error: err instanceof Error ? err.message : String(err),
-                      })
-                    })
-                    return existing
-                  }
-
-                  const title = prMeta.title || b
-                  const body = prMeta.body ?? ""
-                  return prCreate(ctx, ref.meta.project.worktree, host, upstream, {
-                    head,
-                    base,
-                    title,
-                    body,
-                    draft: opt.draft === true,
-                    labels: prMeta.labels,
-                    reviewers: prMeta.reviewers,
-                    assignees: prMeta.assignees,
-                    projects: prMeta.projects,
-                    milestone: prMeta.milestone,
-                    noMaintainerEdit: prMeta.noMaintainerEdit,
-                  })
-                })().catch(async (err) => {
-                  await log("warn", "failed to create PR", {
-                    error: err instanceof Error ? err.message : String(err),
-                    branch: b,
-                  })
-                  return ""
-                })
-
-                const next = await writeMeta(ref.dir, {
-                  ...ref.meta,
-                  github: gh
-                    ? {
-                        ...(ref.meta.github ?? {
-                          host,
-                          upstream: gh.upstream,
-                          fork: gh.fork,
-                          protocol: gh.protocol,
-                          defaultBranch: gh.defaultBranch,
-                          remotes: gh.remotes,
-                        }),
-                        ...(pr ? { pr: { url: pr } } : {}),
-                      }
-                    : ref.meta.github,
-                  publish: {
-                    time: Date.now(),
-                    commit: sha || undefined,
-                    pushed: wantPush && gh ? { remote: gh.remotes.fork, branch: b } : undefined,
-                  },
-                  time: ref.meta.time,
-                })
-
-                if (opt.cleanupSandbox === true) {
-                  await rm(next.sandbox.path, { recursive: true, force: true })
-                }
-
-                return [
-                  `workbench: published`,
-                  `- branch: ${b}`,
-                  `- sandbox: ${ref.meta.sandbox.path}`,
-                  `- target: ${dst}`,
-                  ...(wantPush && gh ? [`- pushed: ${gh.remotes.fork}/${b}`] : []),
-                  ...(pr ? [`- pr: ${pr}`] : []),
-                  ...(sha ? [`- commit: ${sha}`] : []),
-                ].join("\n")
-              },
-            )
-          }
-
-          if (args.action === "cleanup") {
-            const ref = await resolveSandbox(ctx, args.sandbox ?? "")
-            const managed = path.join(r.worktrees, clean(ref.meta.project.id))
-            const rmWorktree = args.removeWorktree === true
-            if (rmWorktree && ref.meta.source.worktree && isInside(managed, ref.meta.source.worktree)) {
-              const root = ref.meta.project.worktree
-              const res = await ctx.$`git -C ${root} worktree remove --force ${ref.meta.source.worktree}`.nothrow().quiet()
-              if (res.exitCode !== 0) {
-                await log("warn", "git worktree remove failed, falling back to rm", {
-                  stderr: res.stderr.toString(),
-                  stdout: res.stdout.toString(),
-                })
-                await rm(ref.meta.source.worktree, { recursive: true, force: true }).catch(() => {})
-              }
-            }
-
-            await rm(ref.meta.sandbox.path, { recursive: true, force: true })
-            await log("info", "sandbox cleaned", { sandbox: ref.meta.sandbox.path, name: ref.meta.name })
-            return `workbench: cleaned sandbox=${ref.meta.sandbox.path}`
+            if (args.action === "bind") return formatBound(saved)
+            return await openFrom(file, saved)
           }
 
           throw new Error("workbench: unsupported action")

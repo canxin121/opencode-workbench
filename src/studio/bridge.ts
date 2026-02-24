@@ -1,10 +1,6 @@
 import os from "node:os"
 import path from "node:path"
-import { readdir, mkdir } from "node:fs/promises"
-import { existsSync } from "node:fs"
-
-const META = ".opencode-workbench.json"
-const CONFIG_FILE = "workbench.toml"
+import { readdir } from "node:fs/promises"
 
 type JsonPrimitive = string | number | boolean | null
 type JsonObject = { [k: string]: JsonValue }
@@ -35,34 +31,34 @@ type BridgeResponse = BridgeSuccess | BridgeFailure
 
 type BridgeContext = {
   sessionId: string
+  parentSessionId?: string
+  childSessionId?: string
   cwd?: string
 }
 
-type Meta = {
+type Scope = "session" | "repo" | "all"
+
+type Entry = {
   version: 1
   id: string
   name: string
-  branch?: string
-  project: {
-    id: string
-    worktree: string
-  }
-  source: {
-    worktree: string
-  }
-  sandbox: {
+  worktree: {
     path: string
+    branch?: string
+  }
+  repo?: {
+    commonDir?: string
+  }
+  github?: {
+    host?: string
+    upstream?: string
+    fork?: string
+    prUrl?: string
   }
   session?: {
     id: string
     parent?: string
-  }
-  github?: {
-    pr?: { url: string }
-  }
-  publish?: {
-    time: number
-    commit?: string
+    title?: string
   }
   time: {
     created: number
@@ -70,47 +66,16 @@ type Meta = {
   }
 }
 
-type Config = {
-  base?: string
-  copyMode?: "archive" | "worktree"
-  copyExclude?: string[]
-  copyExcludeMode?: "append" | "replace"
-  github?: boolean
-  ghHost?: string
-  repo?: string
-  fork?: string
-  forkRemote?: string
-  upstreamRemote?: string
-  protocol?: "auto" | "ssh" | "https"
-  fetch?: boolean
-  push?: boolean
-  pr?: boolean
-  draft?: boolean
-  prLabels?: string[]
-  stage?: "all" | "tracked"
-  commitBodyAuto?: boolean
-  allowDirty?: boolean
-  delete?: boolean
-  lockTimeout?: number
-}
-
-type LoadedConfig = {
-  path: string
-  status: "missing" | "loaded" | "invalid"
-  config: Config
-  mtimeMs: number
-}
-
-type SandboxRow = {
+type BindingRow = {
   name: string
   dir: string
   branch?: string
-  projectId: string
-  projectWorktree: string
-  sourceWorktree: string
+  repoCommonDir?: string
   sessionId?: string
+  parentSessionId?: string
+  upstream?: string
+  fork?: string
   prUrl?: string
-  publishCommit?: string
   updatedAt: number
   createdAt: number
 }
@@ -158,28 +123,20 @@ function resolveContext(request: BridgeRequest): BridgeContext {
   const plugin = asObjectOptional(request.plugin)
   const sessionId =
     readNonEmptyString(ctx?.sessionId) ?? readNonEmptyString(ctx?.sessionID) ?? DEFAULT_SESSION_ID
+  const parentSessionId =
+    readNonEmptyString(ctx?.parentSessionId) ?? readNonEmptyString(ctx?.parentSessionID) ?? sessionId
+  const childSessionId = readNonEmptyString(ctx?.childSessionId) ?? readNonEmptyString(ctx?.childSessionID) ?? undefined
   const cwd =
     readNonEmptyString(ctx?.cwd) ??
     readNonEmptyString(ctx?.directory) ??
     readNonEmptyString(plugin?.rootPath) ??
     undefined
-  return { sessionId, cwd }
+  return { sessionId, parentSessionId, childSessionId, cwd }
 }
 
 async function dispatch(action: string, payload: unknown, context: BridgeContext): Promise<JsonValue> {
-  if (action === "config.get") {
-    return (await loadConfig(await resolveProjectRoot(context.cwd))) as unknown as JsonValue
-  }
-  if (action === "config.set") {
-    const root = asObject(payload, "config.set payload")
-    const raw = "config" in root ? (root.config as unknown) : payload
-    const project = await resolveProjectRoot(context.cwd)
-    const next = normalizeConfig(raw)
-    const saved = await saveConfig(project, next)
-    return saved as unknown as JsonValue
-  }
   if (action === "workbench.snapshot") {
-    return (await snapshot(context)) as unknown as JsonValue
+    return (await snapshot(payload, context)) as unknown as JsonValue
   }
   if (action === "events.poll") {
     return (await eventsPoll(payload, context)) as unknown as JsonValue
@@ -187,39 +144,251 @@ async function dispatch(action: string, payload: unknown, context: BridgeContext
   throw new Error(`unknown action: ${action}`)
 }
 
-async function snapshot(context: BridgeContext) {
-  const projectRoot = await resolveProjectRoot(context.cwd)
-  const config = await loadConfig(projectRoot)
+function resolveWorkbenchBase(): string {
+  const state = process.env.XDG_STATE_HOME?.trim()
+    ? process.env.XDG_STATE_HOME!.trim()
+    : path.join(os.homedir(), ".local", "state")
+  return path.join(state, "opencode", "workbench")
+}
+
+function runCmd(cmd: string[], cwd?: string): { exitCode: number; stdout: string; stderr: string } {
+  try {
+    const res = Bun.spawnSync({
+      cmd,
+      cwd: cwd || undefined,
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const stdout = Buffer.from(res.stdout).toString("utf8")
+    const stderr = Buffer.from(res.stderr).toString("utf8")
+    return { exitCode: res.exitCode ?? 1, stdout, stderr }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { exitCode: 1, stdout: "", stderr: message }
+  }
+}
+
+function checkCmd(cmd: string): { ok: boolean; version: string } {
+  const res = runCmd([cmd, "--version"])
+  const ok = res.exitCode === 0
+  const text = String(ok ? res.stdout : res.stderr).trim()
+  return { ok, version: text.split("\n")[0] ?? "" }
+}
+
+function gitShowTopLevel(cwd: string): string {
+  const res = runCmd(["git", "-C", cwd, "rev-parse", "--show-toplevel"])
+  if (res.exitCode !== 0) return ""
+  return res.stdout.trim()
+}
+
+function gitCommonDir(cwd: string): string {
+  const res = runCmd(["git", "-C", cwd, "rev-parse", "--git-common-dir"])
+  if (res.exitCode !== 0) return ""
+  const out = res.stdout.trim()
+  if (!out) return ""
+  return path.resolve(cwd, out)
+}
+
+function readScope(payload: unknown): Scope {
+  const obj = asObjectOptional(payload)
+  const raw = readNonEmptyString(obj?.scope)
+  if (raw === "all" || raw === "repo" || raw === "session") return raw
+  return "session"
+}
+
+function readSession(payload: unknown): string {
+  const obj = asObjectOptional(payload)
+  return readNonEmptyString(obj?.sessionId) ?? readNonEmptyString(obj?.sessionID) ?? ""
+}
+
+function readParentSession(payload: unknown): string {
+  const obj = asObjectOptional(payload)
+  return readNonEmptyString(obj?.parentSessionId) ?? readNonEmptyString(obj?.parentSessionID) ?? ""
+}
+
+function readChildSession(payload: unknown): string {
+  const obj = asObjectOptional(payload)
+  return readNonEmptyString(obj?.childSessionId) ?? readNonEmptyString(obj?.childSessionID) ?? ""
+}
+
+async function readEntry(file: string): Promise<Entry | null> {
+  const src = Bun.file(file)
+  if (!(await src.exists())) return null
+  const raw = await src.text().catch(() => "")
+  if (!raw.trim()) return null
+  try {
+    const data = JSON.parse(raw) as Entry
+    if (!data || typeof data !== "object") return null
+    if (data.version !== 1) return null
+    if (!data.name || !data.worktree?.path) return null
+    return data
+  } catch {
+    return null
+  }
+}
+
+async function listAllEntries(base: string): Promise<Array<{ file: string; entry: Entry; mtimeMs: number }>> {
+  const root = path.join(base, "entries")
+  const groups = await readdir(root, { withFileTypes: true }).catch(() => [])
+  const out: Array<{ file: string; entry: Entry; mtimeMs: number }> = []
+  for (const g of groups) {
+    if (!g.isDirectory()) continue
+    const dir = path.join(root, g.name)
+    const files = await readdir(dir, { withFileTypes: true }).catch(() => [])
+    for (const f of files) {
+      if (!f.isFile()) continue
+      if (!f.name.endsWith(".json")) continue
+      const file = path.join(dir, f.name)
+      const entry = await readEntry(file)
+      if (!entry) continue
+      const st = await Bun.file(file).stat().catch(() => null)
+      const mtimeMs = st?.mtime?.getTime?.() ? st.mtime.getTime() : 0
+      out.push({ file, entry, mtimeMs })
+    }
+  }
+  out.sort((a, b) => {
+    const at = Math.max(Number(a.entry.time.updated || 0) || 0, a.mtimeMs || 0, Number(a.entry.time.created || 0) || 0)
+    const bt = Math.max(Number(b.entry.time.updated || 0) || 0, b.mtimeMs || 0, Number(b.entry.time.created || 0) || 0)
+    return bt - at
+  })
+  return out
+}
+
+function buildCursor(input: {
+  commonDir: string
+  sessionId: string
+  parentSessionId: string
+  childSessionId: string
+  all: BindingRow[]
+  repo: BindingRow[]
+  session: BindingRow[]
+}) {
+  const latest = (items: BindingRow[]) =>
+    items.reduce((acc, x) => Math.max(acc, x.updatedAt || x.createdAt || 0), 0)
+  const repoSig = input.commonDir ? input.commonDir : "(no-repo)"
+  return [
+    "v2",
+    repoSig,
+    input.sessionId,
+    input.parentSessionId,
+    input.childSessionId,
+    latest(input.all),
+    input.all.length,
+    latest(input.repo),
+    input.repo.length,
+    latest(input.session),
+    input.session.length,
+  ].join(":")
+}
+
+async function snapshot(payload: unknown, context: BridgeContext) {
+  const scope = readScope(payload)
+  const payloadSession = readSession(payload)
+  const payloadParentSession = readParentSession(payload)
+  const payloadChildSession = readChildSession(payload)
+  const cwd = (context.cwd ?? "").trim() ? path.resolve(context.cwd!) : process.cwd()
   const base = resolveWorkbenchBase()
-  const sandboxes = await listSandboxes(base)
-  const filtered = projectRoot
-    ? sandboxes.filter((s) => path.resolve(s.projectWorktree) === path.resolve(projectRoot))
-    : sandboxes
 
   const deps = {
     git: checkCmd("git"),
     gh: checkCmd("gh"),
-    rsync: checkCmd("rsync"),
-    tar: checkCmd("tar"),
   }
 
-  const cursor = buildCursor(config, sandboxes)
+  const sessionId = payloadSession || String(context.sessionId || "").trim()
+  const parentSessionId = payloadParentSession || String(context.parentSessionId || "").trim() || sessionId
+  const childSessionId = payloadChildSession || String(context.childSessionId || "").trim()
+
+  const projectRootDetected = deps.git.ok ? gitShowTopLevel(cwd) : ""
+  const commonDirDetected = deps.git.ok ? gitCommonDir(cwd) : ""
+
+  const all = await listAllEntries(base)
+  const rows: BindingRow[] = all.flatMap(({ entry, mtimeMs }) => {
+    const dir = String(entry.worktree?.path || "").trim()
+    const name = String(entry.name || "").trim()
+    if (!dir || !name) return []
+
+    const branch = String(entry.worktree.branch || "").trim()
+    const repoCommonDir = String(entry.repo?.commonDir || "").trim()
+    const sessionId = String(entry.session?.id || "").trim()
+    const parentSessionId = String(entry.session?.parent || "").trim()
+    const upstream = String(entry.github?.upstream || "").trim()
+    const fork = String(entry.github?.fork || "").trim()
+    const prUrl = String(entry.github?.prUrl || "").trim()
+
+    const updatedAt = Math.max(Number(entry.time?.updated || 0) || 0, Number(mtimeMs || 0) || 0)
+    const createdAt = Math.max(Number(entry.time?.created || 0) || 0, 0)
+
+    const row: BindingRow = {
+      name,
+      dir,
+      ...(branch ? { branch } : {}),
+      ...(repoCommonDir ? { repoCommonDir } : {}),
+      ...(sessionId ? { sessionId } : {}),
+      ...(parentSessionId ? { parentSessionId } : {}),
+      ...(upstream ? { upstream } : {}),
+      ...(fork ? { fork } : {}),
+      ...(prUrl ? { prUrl } : {}),
+      updatedAt,
+      createdAt,
+    }
+
+    return [row]
+  })
+
+  const sessionKeys = new Set([sessionId, parentSessionId, childSessionId].map((x) => String(x || "").trim()).filter(Boolean))
+  const bySessionDirect = sessionKeys.size
+    ? rows.filter((r) => {
+        const sid = String(r.sessionId || "").trim()
+        const pid = String(r.parentSessionId || "").trim()
+        if (sid && sessionKeys.has(sid)) return true
+        if (pid && sessionKeys.has(pid)) return true
+        return false
+      })
+    : []
+
+  const projectRoot = projectRootDetected || bySessionDirect[0]?.dir || ""
+  const bySession = bySessionDirect.length
+    ? bySessionDirect
+    : projectRoot
+      ? rows.filter((r) => path.resolve(r.dir) === path.resolve(projectRoot))
+      : []
+
+  const commonDir = commonDirDetected || bySession[0]?.repoCommonDir || ""
+  const byRepo = commonDir
+    ? rows.filter((r) => (r.repoCommonDir ? path.resolve(r.repoCommonDir) === path.resolve(commonDir) : false))
+    : []
+
+  const selected = scope === "all" ? rows : scope === "repo" ? byRepo : bySession
+
+  const cursor = buildCursor({
+    commonDir,
+    sessionId,
+    parentSessionId,
+    childSessionId,
+    all: rows,
+    repo: byRepo,
+    session: bySession,
+  })
 
   return {
-    sessionId: context.sessionId,
-    cwd: context.cwd ?? "",
-    projectRoot,
+    sessionId,
+    parentSessionId,
+    childSessionId,
+    cwd,
     base,
-    paths: {
-      sandboxes: path.join(base, "sandboxes"),
-      worktrees: path.join(base, "worktrees"),
-      tmp: path.join(base, "tmp"),
-      locks: path.join(base, "locks"),
-    },
-    config,
     deps,
-    sandboxes: filtered,
-    sandboxesAllCount: sandboxes.length,
+    projectRoot,
+    scope,
+    counts: {
+      session: bySession.length,
+      repo: byRepo.length,
+      all: rows.length,
+    },
+    repo: {
+      commonDir,
+    },
+    bindings: selected,
+    bindingsAllCount: rows.length,
     cursor,
     time: Date.now(),
   }
@@ -228,7 +397,15 @@ async function snapshot(context: BridgeContext) {
 async function eventsPoll(payload: unknown, context: BridgeContext) {
   const input = asObjectOptional(payload)
   const prev = readNonEmptyString(input?.cursor) ?? ""
-  const snap = await snapshot(context)
+  const snap = await snapshot(
+    {
+      scope: "session",
+      sessionId: readSession(payload),
+      parentSessionId: readParentSession(payload),
+      childSessionId: readChildSession(payload),
+    },
+    context,
+  )
   if (prev === snap.cursor) {
     return { cursor: snap.cursor, events: [] }
   }
@@ -242,254 +419,6 @@ async function eventsPoll(payload: unknown, context: BridgeContext) {
       },
     ],
   }
-}
-
-function resolveWorkbenchBase(): string {
-  const state = process.env.XDG_STATE_HOME?.trim()
-    ? process.env.XDG_STATE_HOME!.trim()
-    : path.join(os.homedir(), ".local", "state")
-  return path.join(state, "opencode", "workbench")
-}
-
-async function resolveProjectRoot(cwd?: string): Promise<string> {
-  const dir = (cwd ?? "").trim()
-  if (!dir) return ""
-  const sandbox = findSandboxRoot(dir)
-  if (sandbox) {
-    const meta = await readMeta(sandbox)
-    const root = meta?.project?.worktree
-    if (root && root.trim()) return path.resolve(root.trim())
-  }
-  const gitRoot = findGitRoot(dir)
-  return gitRoot ? path.resolve(gitRoot) : path.resolve(dir)
-}
-
-function findGitRoot(start: string): string {
-  let dir = path.resolve(start)
-  for (;;) {
-    const probe = path.join(dir, ".git")
-    try {
-      // git worktrees often have .git as a file; exists() is enough.
-      if (existsSync(probe)) return dir
-    } catch {}
-    const next = path.dirname(dir)
-    if (next === dir) return ""
-    dir = next
-  }
-}
-
-function findSandboxRoot(start: string): string {
-  let dir = path.resolve(start)
-  for (;;) {
-    const meta = path.join(dir, META)
-    try {
-      if (existsSync(meta)) return dir
-    } catch {}
-    const next = path.dirname(dir)
-    if (next === dir) return ""
-    dir = next
-  }
-}
-
-async function readMeta(dir: string): Promise<Meta | null> {
-  const file = Bun.file(path.join(dir, META))
-  if (!(await file.exists())) return null
-  const raw = await file.text().catch(() => "")
-  if (!raw.trim()) return null
-  try {
-    const data = JSON.parse(raw) as Meta
-    if (!data || typeof data !== "object") return null
-    if (data.version !== 1) return null
-    if (!data.sandbox?.path) return null
-    return data
-  } catch {
-    return null
-  }
-}
-
-async function listSandboxes(base: string): Promise<SandboxRow[]> {
-  const root = path.join(base, "sandboxes")
-  const projs = await readdir(root, { withFileTypes: true }).catch(() => [])
-  const out: SandboxRow[] = []
-  for (const p of projs) {
-    if (!p.isDirectory()) continue
-    const proj = path.join(root, p.name)
-    const dirs = await readdir(proj, { withFileTypes: true }).catch(() => [])
-    for (const d of dirs) {
-      if (!d.isDirectory()) continue
-      const dir = path.join(proj, d.name)
-      const meta = await readMeta(dir)
-      if (!meta) continue
-      out.push({
-        name: meta.name,
-        dir,
-        branch: meta.branch,
-        projectId: meta.project.id,
-        projectWorktree: meta.project.worktree,
-        sourceWorktree: meta.source.worktree,
-        sessionId: meta.session?.id,
-        prUrl: meta.github?.pr?.url,
-        publishCommit: meta.publish?.commit,
-        updatedAt: meta.time.updated,
-        createdAt: meta.time.created,
-      })
-    }
-  }
-  return out.sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt))
-}
-
-function buildCursor(config: LoadedConfig, sandboxes: SandboxRow[]): string {
-  const latestSandbox = sandboxes.reduce((acc, s) => Math.max(acc, s.updatedAt || s.createdAt || 0), 0)
-  const count = sandboxes.length
-  const cfg = config.mtimeMs
-  return [cfg, latestSandbox, count].join(":")
-}
-
-function checkCmd(cmd: string): { ok: boolean; version: string } {
-  try {
-    const res = Bun.spawnSync({ cmd: [cmd, "--version"], stdout: "pipe", stderr: "pipe" })
-    const ok = res.exitCode === 0
-    const text = Buffer.from(ok ? res.stdout : res.stderr).toString("utf8").trim()
-    return { ok, version: text.split("\n")[0] ?? "" }
-  } catch {
-    return { ok: false, version: "" }
-  }
-}
-
-async function loadConfig(projectRoot: string): Promise<LoadedConfig> {
-  const file = path.join(projectRoot || process.cwd(), ".opencode", CONFIG_FILE)
-  const src = Bun.file(file)
-  if (!(await src.exists())) {
-    return { path: file, status: "missing", config: {}, mtimeMs: 0 }
-  }
-  const raw = await src.text().catch(() => "")
-  const stat = await src.stat().catch(() => null)
-  const mtimeMs = stat?.mtime?.getTime?.() ? stat.mtime.getTime() : 0
-  if (!raw.trim()) return { path: file, status: "invalid", config: {}, mtimeMs }
-
-  const obj = (() => {
-    try {
-      const parsed = Bun.TOML.parse(raw)
-      if (!parsed || typeof parsed !== "object") return null
-      return parsed as Record<string, unknown>
-    } catch {
-      return null
-    }
-  })()
-  if (!obj) return { path: file, status: "invalid", config: {}, mtimeMs }
-
-  const data = (() => {
-    const scoped = (obj as any).workbench
-    if (scoped && typeof scoped === "object") return scoped as Record<string, unknown>
-    return obj
-  })()
-
-  return { path: file, status: "loaded", config: normalizeConfig(data), mtimeMs }
-}
-
-function normalizeConfig(raw: unknown): Config {
-  const data = asObjectOptional(raw) ?? {}
-  const one = <T extends string>(value: unknown, allowed: readonly T[]) =>
-    typeof value === "string" && allowed.includes(value as T) ? (value as T) : undefined
-  const str = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim() : undefined)
-  const bool = (value: unknown) => (typeof value === "boolean" ? value : undefined)
-  const num = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : undefined)
-  const list = (value: unknown) =>
-    Array.isArray(value)
-      ? value
-          .filter((x): x is string => typeof x === "string")
-          .map((x) => x.trim())
-          .filter(Boolean)
-      : undefined
-
-  return {
-    base: str(data.base),
-    copyMode: one(data.copyMode, ["archive", "worktree"]),
-    copyExclude: list(data.copyExclude),
-    copyExcludeMode: one(data.copyExcludeMode, ["append", "replace"]),
-    github: bool(data.github),
-    ghHost: str(data.ghHost),
-    repo: str(data.repo),
-    fork: str(data.fork),
-    forkRemote: str(data.forkRemote),
-    upstreamRemote: str(data.upstreamRemote),
-    protocol: one(data.protocol, ["auto", "ssh", "https"]),
-    fetch: bool(data.fetch),
-    push: bool(data.push),
-    pr: bool(data.pr),
-    draft: bool(data.draft),
-    prLabels: list(data.prLabels),
-    stage: one(data.stage, ["all", "tracked"]),
-    commitBodyAuto: bool(data.commitBodyAuto),
-    allowDirty: bool(data.allowDirty),
-    delete: bool(data.delete),
-    lockTimeout: num(data.lockTimeout),
-  }
-}
-
-async function saveConfig(projectRoot: string, config: Config) {
-  const base = projectRoot || process.cwd()
-  const file = path.join(base, ".opencode", CONFIG_FILE)
-  await mkdir(path.dirname(file), { recursive: true })
-
-  const src = Bun.file(file)
-  const raw = (await src.exists()) ? await src.text().catch(() => "") : ""
-  const next = patchWorkbenchSection(raw, config)
-  await Bun.write(file, next)
-  const loaded = await loadConfig(base)
-  return { path: file, config: loaded.config, status: loaded.status }
-}
-
-function patchWorkbenchSection(raw: string, config: Config): string {
-  const lines = String(raw || "").replace(/\r\n/g, "\n").split("\n")
-  const section = renderWorkbenchSection(config)
-  if (!section.trim()) {
-    return raw.trimEnd() ? raw.trimEnd() + "\n" : ""
-  }
-
-  const start = lines.findIndex((l) => l.trim() === "[workbench]")
-  if (start === -1) {
-    const head = raw.trimEnd()
-    return `${head ? head + "\n\n" : ""}${section.trimEnd()}\n`
-  }
-
-  let end = start + 1
-  for (; end < lines.length; end++) {
-    const t = lines[end].trim()
-    if (t.startsWith("[") && t.endsWith("]")) break
-  }
-  const before = lines.slice(0, start)
-  const after = lines.slice(end)
-  const merged = [...before, ...section.trimEnd().split("\n"), ...after]
-  return merged.join("\n").trimEnd() + "\n"
-}
-
-function renderWorkbenchSection(config: Config): string {
-  const cleaned: Record<string, unknown> = {}
-  for (const [k, v] of Object.entries(config)) {
-    if (v === undefined || v === null) continue
-    if (Array.isArray(v) && !v.length) continue
-    cleaned[k] = v
-  }
-  const keys = Object.keys(cleaned)
-  if (!keys.length) return ""
-
-  const lines: string[] = ["[workbench]"]
-  const serialize = (value: unknown): string => {
-    if (typeof value === "string") return JSON.stringify(value)
-    if (typeof value === "number" || typeof value === "boolean") return String(value)
-    if (Array.isArray(value)) return `[${value.map((x) => serialize(x)).join(", ")}]`
-    return ""
-  }
-
-  for (const key of keys.sort()) {
-    const value = cleaned[key]
-    const encoded = serialize(value)
-    if (!encoded) continue
-    lines.push(`${key} = ${encoded}`)
-  }
-  lines.push("")
-  return lines.join("\n")
 }
 
 function ok(data: JsonValue): BridgeSuccess {

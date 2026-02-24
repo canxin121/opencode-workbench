@@ -16,9 +16,14 @@ async function main() {
   const base = path.join(os.tmpdir(), `opencode-workbench-selfcheck-${Date.now()}`)
   const state = path.join(base, "state")
   const repo = path.join(base, "repo")
+  const nonGitDir = path.join(base, "non-git")
+  const reuseRepo = path.join(base, "reuse-repo")
+  process.env.XDG_STATE_HOME = state
   await mkdir(base, { recursive: true })
   await mkdir(state, { recursive: true })
   await mkdir(repo, { recursive: true })
+  await mkdir(nonGitDir, { recursive: true })
+  await mkdir(reuseRepo, { recursive: true })
 
   await cmd(repo, ["git", "init", "-q"])
   await Bun.write(path.join(repo, "README.md"), "hello\n")
@@ -31,21 +36,21 @@ async function main() {
 
   await mkdir(path.join(repo, ".opencode"), { recursive: true })
   await Bun.write(path.join(repo, ".opencode", "opencode.jsonc"), "{}\n")
-  await Bun.write(
-    path.join(repo, ".opencode", "workbench.toml"),
-    [
-      'copyMode = "worktree"',
-      'commitBodyAuto = true',
-      'stage = "tracked"',
-      'lockTimeout = 60',
-      '',
-    ].join("\n"),
-  )
 
   await cmd(repo, ["git", "add", ".opencode"])
-  await cmd(repo, ["git", "commit", "--no-gpg-sign", "-m", "add workbench config", "-q"])
+  await cmd(repo, ["git", "commit", "--no-gpg-sign", "-m", "init opencode config", "-q"])
 
   await Bun.write(path.join(repo, "LOCAL.txt"), "local\n")
+
+  await cmd(reuseRepo, ["git", "init", "-q"])
+  await Bun.write(path.join(reuseRepo, "README.md"), "reuse\n")
+  await cmd(reuseRepo, ["git", "add", "README.md"])
+  await cmd(reuseRepo, ["git", "-c", "user.name=demo", "-c", "user.email=demo@example.com", "commit", "-m", "init", "-q"])
+
+  const createdSessions: string[] = []
+  const promptCalls: any[] = []
+  const activePromptSessions = new Set<string>()
+  const overlappedPromptSessions = new Set<string>()
 
   const ctx: any = {
     directory: repo,
@@ -64,8 +69,32 @@ async function main() {
         log: async () => ({ data: true }),
       },
       session: {
-        create: async () => ({ data: { id: "ses_test" } }),
+        create: async () => {
+          const id = `ses_test_${createdSessions.length + 1}`
+          createdSessions.push(id)
+          return { data: { id } }
+        },
         promptAsync: async () => ({ data: undefined }),
+        prompt: async (input: any) => {
+          promptCalls.push(input)
+          const sessionID = String(input?.path?.id || "").trim()
+          const bodyText = String(input?.body?.parts?.[0]?.text || "")
+          if (sessionID && activePromptSessions.has(sessionID)) {
+            overlappedPromptSessions.add(sessionID)
+          }
+          if (sessionID) activePromptSessions.add(sessionID)
+          try {
+            await Bun.sleep(bodyText.includes("slow") ? 40 : 5)
+          } finally {
+            if (sessionID) activePromptSessions.delete(sessionID)
+          }
+          return {
+            data: {
+              info: { id: "msg_worker" },
+              parts: [{ type: "text", text: `worker done: ${bodyText}` }],
+            },
+          }
+        },
       },
     },
   }
@@ -85,41 +114,260 @@ async function main() {
   }
 
   const name = "sbx"
+  await def.execute(schema.parse({ action: "open", name, dir: repo }), toolCtx)
+  const workerSession = createdSessions[0]
+  if (!workerSession) throw new Error("open did not create worker session")
+  const listRepo = await def.execute(schema.parse({ action: "list", scope: "repo" }), toolCtx)
+  if (!String(listRepo).includes(name)) throw new Error("repo list did not include binding")
+  const listSupervisor = await def.execute(schema.parse({ action: "list" }), toolCtx)
+  if (!String(listSupervisor).includes(name)) throw new Error("supervisor session list did not include child binding")
+  const infoSupervisorDefault = await def.execute(schema.parse({ action: "info" }), toolCtx)
+  if (!String(infoSupervisorDefault).includes(name)) throw new Error("info default should follow session-scoped binding resolution")
+
+  await def.execute(schema.parse({ action: "bind", dir: repo, ghHost: "github.com" }), toolCtx)
+  const listRepoAfterMerge = await def.execute(schema.parse({ action: "list", scope: "repo" }), toolCtx)
+  const repoRowsAfterMerge = String(listRepoAfterMerge)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+  if (repoRowsAfterMerge.length !== 1) throw new Error("bind dir upsert should not create duplicate bindings")
+  if (!repoRowsAfterMerge[0]?.includes(name)) throw new Error("bind dir upsert should preserve existing binding name")
+
+  const info = await def.execute(schema.parse({ action: "info", name }), toolCtx)
+  if (!String(info).includes(repo)) throw new Error("info did not include dir")
+
+  let invalidPrRejected = false
+  await def.execute(schema.parse({ action: "bind", name, prUrl: "not-a-url" }), toolCtx).catch(() => {
+    invalidPrRejected = true
+  })
+  if (!invalidPrRejected) throw new Error("bind should reject invalid prUrl")
+
+  let invalidUpstreamRejected = false
+  await def.execute(schema.parse({ action: "bind", name, upstream: "bad-format" }), toolCtx).catch(() => {
+    invalidUpstreamRejected = true
+  })
+  if (!invalidUpstreamRejected) throw new Error("bind should reject invalid upstream format")
+
+  let invalidForkRejected = false
+  await def.execute(schema.parse({ action: "bind", name, fork: "bad-format" }), toolCtx).catch(() => {
+    invalidForkRejected = true
+  })
+  if (!invalidForkRejected) throw new Error("bind should reject invalid fork format")
+
   await def.execute(
-    schema.parse({ action: "create", name, branch: "main", sourceWorktree: repo }),
+    schema.parse({ action: "bind", name, upstream: "org/repo", fork: "me/repo", prUrl: "https://github.com/org/repo/pull/12" }),
     toolCtx,
   )
+  const infoWithMeta = await def.execute(schema.parse({ action: "info", name }), toolCtx)
+  if (!String(infoWithMeta).includes("pull/12")) throw new Error("bind should record valid prUrl")
 
-  const sandbox = path.join(state, "workbench", "sandboxes", "proj", name)
-  const meta = path.join(sandbox, ".opencode-workbench.json")
-  if (!(await Bun.file(meta).exists())) throw new Error("meta file not created")
-  if (!(await Bun.file(path.join(sandbox, "LOCAL.txt")).exists())) throw new Error("copyMode config not applied")
+  await def.execute(schema.parse({ action: "bind", name, clear: "prUrl" }), toolCtx)
+  const infoPrCleared = await def.execute(schema.parse({ action: "info", name }), toolCtx)
+  if (String(infoPrCleared).includes("pull/12")) throw new Error("clear=prUrl should remove prUrl metadata")
 
-  await rm(path.join(repo, "LOCAL.txt"), { force: true })
+  await def.execute(schema.parse({ action: "bind", name, clear: "github" }), toolCtx)
+  const infoGithubCleared = await def.execute(schema.parse({ action: "info", name }), toolCtx)
+  if (String(infoGithubCleared).includes("github:")) throw new Error("clear=github should remove github metadata")
 
-  await Bun.write(path.join(sandbox, "README.md"), "changed\n")
-  await def.execute(schema.parse({ action: "preview", sandbox: name, targetWorktree: repo }), toolCtx)
+  await def.execute(schema.parse({ action: "open", name: "reuse", dir: reuseRepo }), toolCtx)
+  await def.execute(schema.parse({ action: "bind", name: "reuse", dir: reuseRepo, prUrl: "https://github.com/old/repo/pull/9" }), toolCtx)
+  const reuseInfoBefore = await def.execute(schema.parse({ action: "info", name: "reuse", dir: reuseRepo }), toolCtx)
+  if (!String(reuseInfoBefore).includes("pull/9")) throw new Error("reuse repo should store initial PR metadata")
+  await rm(path.join(reuseRepo, ".git"), { recursive: true, force: true })
+  await cmd(reuseRepo, ["git", "init", "-q"])
+  await Bun.write(path.join(reuseRepo, "README.md"), "reuse-new\n")
+  await cmd(reuseRepo, ["git", "add", "README.md"])
+  await cmd(reuseRepo, ["git", "-c", "user.name=demo", "-c", "user.email=demo@example.com", "commit", "-m", "reinit", "-q"])
+  await def.execute(schema.parse({ action: "bind", name: "reuse", dir: reuseRepo }), toolCtx)
+  const reuseInfoAfter = await def.execute(schema.parse({ action: "info", name: "reuse", dir: reuseRepo }), toolCtx)
+  if (String(reuseInfoAfter).includes("pull/9")) throw new Error("repo identity change should clear stale PR metadata")
 
-  await def.execute(
+  const toolCtxNonGit = { ...toolCtx, directory: nonGitDir, worktree: nonGitDir }
+  const infoByNameNonGit = await def.execute(schema.parse({ action: "info", name }), toolCtxNonGit)
+  if (!String(infoByNameNonGit).includes(repo)) throw new Error("name-only info should resolve outside git cwd when unique")
+  const openByNameNonGit = await def.execute(schema.parse({ action: "open", name }), toolCtxNonGit)
+  if (!String(openByNameNonGit).includes(name)) throw new Error("name-only open should resolve outside git cwd when unique")
+
+  const toolCtxChild = { ...toolCtx, sessionID: workerSession }
+  const listSession = await def.execute(schema.parse({ action: "list" }), toolCtxChild)
+  if (!String(listSession).includes(name)) throw new Error("session list did not include binding")
+
+  const before = hooks["tool.execute.before"] as
+    | ((input: { tool: string; sessionID: string; callID: string }, output: { args: Record<string, unknown> }) => Promise<void>)
+    | undefined
+  if (!before) throw new Error("tool.execute.before hook missing")
+
+  let nonGitBindBlocked = false
+  await def.execute(schema.parse({ action: "bind", name: "bad-bind", dir: nonGitDir }), toolCtx).catch(() => {
+    nonGitBindBlocked = true
+  })
+  if (!nonGitBindBlocked) throw new Error("bind should reject non-git directories")
+
+  let nonGitOpenBlocked = false
+  await def.execute(schema.parse({ action: "open", name: "bad-open", dir: nonGitDir }), toolCtx).catch(() => {
+    nonGitOpenBlocked = true
+  })
+  if (!nonGitOpenBlocked) throw new Error("open should reject non-git directories")
+
+  let nonGitTaskBlocked = false
+  await def.execute(schema.parse({ action: "task", prompt: "x", dir: nonGitDir }), toolCtx).catch(() => {
+    nonGitTaskBlocked = true
+  })
+  if (!nonGitTaskBlocked) throw new Error("task should reject non-git directories")
+
+  const taskDefault = { args: { directory: ".workbench/w2" } as Record<string, unknown> }
+  await before({ tool: "task", sessionID: "ses_default", callID: "c_task_default" }, taskDefault)
+  if (taskDefault.args.task_id) throw new Error("default task mode should not auto-route task_id")
+
+  const taskParent = { args: { prompt: "p" } as Record<string, unknown> }
+  await before({ tool: "task", sessionID: "ses_parent", callID: "c_task_parent" }, taskParent)
+  if (taskParent.args.task_id !== workerSession) throw new Error("task auto-routing for supervisor failed")
+
+  const taskChild = { args: { prompt: "p" } as Record<string, unknown> }
+  await before({ tool: "task", sessionID: workerSession, callID: "c_task_child" }, taskChild)
+  if (taskChild.args.task_id !== workerSession) throw new Error("task auto-routing for implementation session failed")
+
+  const taskByDirBlocked = {
+    args: {
+      directory: ".workbench/w2",
+    } as Record<string, unknown>,
+  }
+  let blocked = false
+  await before({ tool: "task", sessionID: "ses_parent", callID: "c_task_dir" }, taskByDirBlocked).catch(() => {
+    blocked = true
+  })
+  if (!blocked) throw new Error("task directory guard failed")
+
+  const workbenchDir = path.join(repo, ".workbench", "w2")
+  await cmd(repo, ["git", "worktree", "add", ".workbench/w2", "-b", "w2", "-q"])
+  const taskOut = await def.execute(
     schema.parse({
-      action: "publish",
-      sandbox: name,
-      targetWorktree: repo,
-      commitMessage: "workbench: selfcheck",
+      action: "task",
+      prompt: "do work",
+      agent: "general",
+      dir: ".workbench/w2",
     }),
     toolCtx,
   )
+  if (!String(taskOut).includes("task_id:")) throw new Error("workbench task output missing task_id")
+  if (!String(taskOut).includes("task_queue_ms:")) throw new Error("workbench task output missing queue timing")
+  if (!String(taskOut).includes("task_run_ms:")) throw new Error("workbench task output missing run timing")
+  if (!String(taskOut).includes("worker done")) throw new Error("workbench task output missing worker text")
+  const worktreeSession = String(taskOut).match(/task_id:\s+([^\s]+)/)?.[1]
+  if (!worktreeSession) throw new Error("workbench task output missing routed session id")
+  const promptCall = promptCalls.at(-1)
+  if (!promptCall || promptCall?.query?.directory !== workbenchDir) throw new Error("workbench task did not pin directory")
 
-  const log = await cmd(repo, ["git", "log", "-1", "--pretty=%s"])
-  if (!log.includes("workbench")) throw new Error("publish did not commit")
+  const toolCtxParent2 = { ...toolCtx, sessionID: "ses_parent_2" }
+  const taskOut2 = await def.execute(
+    schema.parse({
+      action: "task",
+      prompt: "do work again",
+      agent: "general",
+      dir: ".workbench/w2",
+    }),
+    toolCtxParent2,
+  )
+  const worktreeSession2 = String(taskOut2).match(/task_id:\s+([^\s]+)/)?.[1]
+  if (!worktreeSession2) throw new Error("workbench task should return a parent-local child session when parent changes")
+  if (!String(taskOut2).includes(`task_id: ${worktreeSession2}`)) {
+    throw new Error("workbench task should return the re-parented session id")
+  }
+  const promptCall2 = promptCalls.at(-1)
+  if (!promptCall2 || promptCall2?.path?.id !== worktreeSession2) throw new Error("workbench task should prompt in the re-parented session")
+  if (!promptCall2 || promptCall2?.query?.directory !== workbenchDir) throw new Error("workbench task should keep the bound worktree directory")
 
-  const body = await cmd(repo, ["git", "log", "-1", "--pretty=%b"])
-  if (!body.includes("Files:")) throw new Error("commitBodyAuto config not applied")
+  const taskParent2 = { args: { prompt: "p" } as Record<string, unknown> }
+  await before({ tool: "task", sessionID: "ses_parent_2", callID: "c_task_parent2" }, taskParent2)
+  if (taskParent2.args.task_id !== worktreeSession2) throw new Error("task auto-routing should follow re-parented binding session")
 
-  await def.execute(schema.parse({ action: "checkpoint", sandbox: name, name: "sbx2" }), toolCtx)
-  await def.execute(schema.parse({ action: "reset", sandbox: name, resetBackup: false, resetDelete: true }), toolCtx)
-  await def.execute(schema.parse({ action: "rename", sandbox: name, renameTo: "sbx-renamed", force: true }), toolCtx)
-  await def.execute(schema.parse({ action: "gc", gcDays: 0, gcApply: false }), toolCtx)
+  const [slowTask, fastTask] = await Promise.all([
+    def.execute(
+      schema.parse({ action: "task", task_id: worktreeSession2, prompt: "slow-task-a", agent: "general" }),
+      toolCtxParent2,
+    ),
+    def.execute(
+      schema.parse({ action: "task", task_id: worktreeSession2, prompt: "fast-task-b", agent: "general" }),
+      toolCtxParent2,
+    ),
+  ])
+  if (!String(slowTask).includes("slow-task-a")) throw new Error("serialized task output mismatch for first concurrent task")
+  if (!String(fastTask).includes("fast-task-b")) throw new Error("serialized task output mismatch for second concurrent task")
+  if (!String(slowTask).includes("task_queue_ms:") || !String(fastTask).includes("task_queue_ms:")) {
+    throw new Error("serialized task outputs should include queue timing")
+  }
+  if (!String(slowTask).includes("task_queued: yes") && !String(fastTask).includes("task_queued: yes")) {
+    throw new Error("at least one concurrent task should report queued execution")
+  }
+  if (overlappedPromptSessions.has(worktreeSession2)) {
+    throw new Error("tasks targeting the same session should be serialized")
+  }
+
+  const listByParentChild = await def.execute(
+    schema.parse({ action: "list", scope: "session", parentSessionId: "ses_parent_2", sessionId: worktreeSession2 }),
+    toolCtx,
+  )
+  if (!String(listByParentChild).includes("w2")) throw new Error("session list should honor parentSessionId+sessionId targeting")
+
+  const infoByParentChild = await def.execute(
+    schema.parse({ action: "info", parentSessionId: "ses_parent_2", sessionId: worktreeSession2 }),
+    toolCtx,
+  )
+  if (!String(infoByParentChild).includes(workbenchDir)) throw new Error("info should honor parentSessionId+sessionId targeting")
+
+  let strictInfoBlocked = false
+  await def
+    .execute(schema.parse({ action: "info", parentSessionId: "ses_parent_2", sessionId: "ses_parent", strict: true }), toolCtx)
+    .catch(() => {
+      strictInfoBlocked = true
+    })
+  if (!strictInfoBlocked) throw new Error("strict info should fail when multiple bindings match")
+
+  const activeWorktreeSession = worktreeSession2
+  const outsideDenied = { args: { filePath: path.join(repo, "README.md") } as Record<string, unknown> }
+  let deniedOutside = false
+  await before({ tool: "edit", sessionID: activeWorktreeSession, callID: "c_edit_worker_out" }, outsideDenied).catch(() => {
+    deniedOutside = true
+  })
+  if (!deniedOutside) throw new Error("worker boundary guard failed")
+
+  const insideAllowed = { args: { filePath: path.join(workbenchDir, "README.md") } as Record<string, unknown> }
+  await before({ tool: "edit", sessionID: activeWorktreeSession, callID: "c_edit_worker_in" }, insideAllowed)
+
+  const infoByDir = await def.execute(schema.parse({ action: "info", name: "w2", dir: repo }), toolCtx)
+  if (!String(infoByDir).includes(workbenchDir)) throw new Error("directory task did not create/update binding")
+
+  const infoDirOnly = await def.execute(schema.parse({ action: "info", dir: workbenchDir }), toolCtx)
+  if (!String(infoDirOnly).includes(workbenchDir)) throw new Error("info with dir only should resolve binding")
+
+  const removeMissing = await def.execute(schema.parse({ action: "remove", name: "missing", dir: repo }), toolCtx)
+  if (!String(removeMissing).includes("binding not found")) throw new Error("remove missing binding should be explicit")
+
+  const editDenied = { args: { filePath: path.join(repo, "README.md") } as Record<string, unknown> }
+  let denied = false
+  await before({ tool: "edit", sessionID: "ses_parent", callID: "c_edit_deny" }, editDenied).catch(() => {
+    denied = true
+  })
+  if (!denied) throw new Error("supervisor edit guard failed")
+
+  const editAllowed = { args: { filePath: path.join(repo, ".gitignore") } as Record<string, unknown> }
+  await before({ tool: "edit", sessionID: "ses_parent", callID: "c_edit_allow" }, editAllowed)
+
+  await def.execute(schema.parse({ action: "bind", prUrl: "https://github.com/org/repo/pull/1" }), toolCtxChild)
+  const infoSession = await def.execute(schema.parse({ action: "info" }), toolCtxChild)
+  if (!String(infoSession).includes("pull/1")) throw new Error("session bind did not update prUrl")
+
+  await def.execute(schema.parse({ action: "bind", name: "tmp", dir: repo }), toolCtx)
+  const removeByNameNonGit = await def.execute(schema.parse({ action: "remove", name: "tmp" }), toolCtxNonGit)
+  if (!String(removeByNameNonGit).includes("removed tmp")) throw new Error("name-only remove should resolve outside git cwd when unique")
+
+  await def.execute(schema.parse({ action: "remove" }), toolCtxChild)
+  const listRepo2 = await def.execute(schema.parse({ action: "list", scope: "repo" }), toolCtx)
+  if (String(listRepo2).includes(name)) throw new Error("remove did not delete binding")
+
+  await rm(workbenchDir, { recursive: true, force: true })
+  const listRepoPruned = await def.execute(schema.parse({ action: "list", scope: "repo" }), toolCtx)
+  if (String(listRepoPruned).includes("w2")) throw new Error("repo list should prune stale bindings with missing directories")
 
   await rm(base, { recursive: true, force: true })
   console.log("selfcheck ok")

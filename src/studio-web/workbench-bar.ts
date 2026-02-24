@@ -27,45 +27,52 @@ export type StudioMountOptions = {
 
 type Snapshot = {
   sessionId: string
+  parentSessionId?: string
+  childSessionId?: string
   cwd: string
-  projectRoot: string
   base: string
+  scope: "session" | "repo" | "all"
+  counts: {
+    session: number
+    repo: number
+    all: number
+  }
   deps: {
     git: { ok: boolean; version: string }
     gh: { ok: boolean; version: string }
-    rsync: { ok: boolean; version: string }
-    tar: { ok: boolean; version: string }
   }
-  config: {
-    path: string
-    status: "missing" | "loaded" | "invalid"
-    config: Record<string, JsonValue>
+  projectRoot: string
+  repo: {
+    commonDir: string
   }
-  sandboxes: Array<{
+  bindings: Array<{
     name: string
     dir: string
     branch?: string
-    projectId: string
-    projectWorktree: string
-    sourceWorktree: string
     sessionId?: string
+    parentSessionId?: string
+    upstream?: string
+    fork?: string
     prUrl?: string
-    publishCommit?: string
     updatedAt: number
     createdAt: number
   }>
-  sandboxesAllCount: number
+  bindingsAllCount: number
+  cursor: string
+  time: number
 }
 
 type State = {
   sessionId: string
+  parentSessionId: string
+  childSessionId: string
   collapsed: boolean
-  detailsOpen: boolean
+  scope: "session" | "repo"
+  infoOpen: boolean
   loading: boolean
   busy: boolean
   error: string | null
   snapshot: Snapshot | null
-  showAll: boolean
 }
 
 function asObject(value: JsonValue | undefined | null): Record<string, JsonValue> {
@@ -102,9 +109,6 @@ function iconSvg(name: string, className: string): string {
   if (name === "wrench") {
     return `<svg ${common}><path d="M14.7 6.3a4 4 0 0 0-5.6 5.6l-6.2 6.2a2 2 0 0 0 2.8 2.8l6.2-6.2a4 4 0 0 0 5.6-5.6l-2.1 2.1-2.8-2.8 2.1-2.1Z"/></svg>`
   }
-  if (name === "help") {
-    return `<svg ${common}><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 1 1 5.82 1c0 2-3 2-3 4"/><path d="M12 17h.01"/></svg>`
-  }
   if (name === "x") {
     return `<svg ${common}><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>`
   }
@@ -117,40 +121,32 @@ function iconSvg(name: string, className: string): string {
   if (name === "list") {
     return `<svg ${common}><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg>`
   }
+  if (name === "help") {
+    return `<svg ${common}><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 4.2 1.8c-.9.8-1.7 1.3-1.7 2.2"/><path d="M12 16h.01"/></svg>`
+  }
   return ""
 }
 
 function parseSnapshot(value: JsonValue): Snapshot | null {
   const obj = asObject(value)
-  const configObj = asObject(obj.config)
   const depsObj = asObject(obj.deps)
-
-  const deps = {
-    git: parseDep(depsObj.git),
-    gh: parseDep(depsObj.gh),
-    rsync: parseDep(depsObj.rsync),
-    tar: parseDep(depsObj.tar),
-  }
-
-  const sandboxes = asArray(obj.sandboxes)
+  const repoObj = asObject(obj.repo)
+  const countsObj = asObject(obj.counts)
+  const bindings = asArray(obj.bindings)
     .map((row) => {
       const r = asObject(row)
       const name = toStringValue(r.name)
       const dir = toStringValue(r.dir)
-      const projectId = toStringValue(r.projectId)
-      const projectWorktree = toStringValue(r.projectWorktree)
-      const sourceWorktree = toStringValue(r.sourceWorktree)
-      if (!name || !dir || !projectId || !projectWorktree) return null
+      if (!name || !dir) return null
       return {
         name,
         dir,
         branch: toStringValue(r.branch) || undefined,
-        projectId,
-        projectWorktree,
-        sourceWorktree,
         sessionId: toStringValue(r.sessionId) || undefined,
+        parentSessionId: toStringValue(r.parentSessionId) || undefined,
+        upstream: toStringValue(r.upstream) || undefined,
+        fork: toStringValue(r.fork) || undefined,
         prUrl: toStringValue(r.prUrl) || undefined,
-        publishCommit: toStringValue(r.publishCommit) || undefined,
         updatedAt: toNumber(r.updatedAt),
         createdAt: toNumber(r.createdAt),
       }
@@ -159,17 +155,29 @@ function parseSnapshot(value: JsonValue): Snapshot | null {
 
   return {
     sessionId: toStringValue(obj.sessionId),
+    parentSessionId: toStringValue(obj.parentSessionId) || undefined,
+    childSessionId: toStringValue(obj.childSessionId) || undefined,
     cwd: toStringValue(obj.cwd),
-    projectRoot: toStringValue(obj.projectRoot),
     base: toStringValue(obj.base),
-    deps,
-    config: {
-      path: toStringValue(configObj.path),
-      status: toStringValue(configObj.status) === "loaded" ? "loaded" : toStringValue(configObj.status) === "invalid" ? "invalid" : "missing",
-      config: asObject(configObj.config),
+    scope:
+      toStringValue(obj.scope) === "all" ? "all" : toStringValue(obj.scope) === "repo" ? "repo" : "session",
+    counts: {
+      session: toNumber(countsObj.session),
+      repo: toNumber(countsObj.repo),
+      all: toNumber(countsObj.all),
     },
-    sandboxes,
-    sandboxesAllCount: toNumber(obj.sandboxesAllCount),
+    deps: {
+      git: parseDep(depsObj.git),
+      gh: parseDep(depsObj.gh),
+    },
+    projectRoot: toStringValue(obj.projectRoot),
+    repo: {
+      commonDir: toStringValue(repoObj.commonDir),
+    },
+    bindings,
+    bindingsAllCount: toNumber(obj.bindingsAllCount),
+    cursor: toStringValue(obj.cursor),
+    time: toNumber(obj.time),
   }
 }
 
@@ -187,29 +195,29 @@ function prId(url?: string): string {
   return m?.[1] ?? ""
 }
 
-function shortHash(hash?: string): string {
-  const h = String(hash || "")
-  return h.length >= 8 ? h.slice(0, 8) : h
-}
-
 export function mount(el: HTMLElement, opts: StudioMountOptions) {
-  const sessionId = String(opts.context?.sessionId || "").trim()
+  const sessionId = String(opts.context?.sessionId || opts.context?.sessionID || "").trim()
+  const parentSessionId = String(opts.context?.parentSessionId || opts.context?.parentSessionID || sessionId).trim()
+  const childSessionId = String(opts.context?.childSessionId || opts.context?.childSessionID || "").trim()
 
   const state: State = {
     sessionId,
+    parentSessionId,
+    childSessionId,
     collapsed: true,
-    detailsOpen: false,
+    scope: "session",
+    infoOpen: false,
     loading: false,
     busy: false,
     error: null,
     snapshot: null,
-    showAll: false,
   }
 
   let refreshTimer: number | null = null
   let stopEvents: (() => void) | null = null
   let reserveObserver: ResizeObserver | null = null
   let reserveRaf = 0
+  let refreshSeq = 0
 
   function setReservePx(px: number) {
     if (!opts.layout) return
@@ -245,6 +253,7 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
   }
 
   async function refreshAll() {
+    const seq = ++refreshSeq
     if (!isVisible()) {
       state.snapshot = null
       state.error = null
@@ -258,14 +267,24 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
     render()
     scheduleReserveUpdate()
     try {
-      const raw = await invoke("workbench.snapshot")
+      const raw = await invoke("workbench.snapshot", {
+        scope: state.scope,
+        sessionId: state.sessionId,
+        parentSessionId: state.parentSessionId,
+        childSessionId: state.childSessionId,
+      })
       const snap = parseSnapshot(raw)
       if (!snap) throw new Error("Snapshot is unavailable")
+      if (seq !== refreshSeq) return
       state.snapshot = snap
+      state.parentSessionId = String(snap.parentSessionId || state.parentSessionId || state.sessionId).trim()
+      state.childSessionId = String(snap.childSessionId || state.childSessionId || "").trim()
     } catch (error) {
+      if (seq !== refreshSeq) return
       state.error = error instanceof Error ? error.message : String(error)
       state.snapshot = null
     } finally {
+      if (seq !== refreshSeq) return
       state.loading = false
       render()
       scheduleReserveUpdate()
@@ -283,8 +302,7 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
   function toggleCollapsed() {
     state.collapsed = !state.collapsed
     if (state.collapsed) {
-      state.showAll = false
-      state.detailsOpen = false
+      state.infoOpen = false
       render()
       scheduleReserveUpdate()
       return
@@ -292,27 +310,20 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
     void refreshAll()
   }
 
-  function toggleDetails() {
-    state.detailsOpen = !state.detailsOpen
-    render()
-    scheduleReserveUpdate()
+  function toggleScope() {
+    state.scope = state.scope === "session" ? "repo" : "session"
+    state.infoOpen = false
+    void refreshAll()
   }
 
-  function closeDetails() {
-    if (!state.detailsOpen) return
-    state.detailsOpen = false
-    render()
-    scheduleReserveUpdate()
-  }
-
-  function toggleAll() {
-    state.showAll = !state.showAll
+  function toggleInfo() {
+    state.infoOpen = !state.infoOpen
     render()
     scheduleReserveUpdate()
   }
 
   function renderCollapsedButton(): string {
-    const count = state.snapshot?.sandboxes.length ?? 0
+    const count = state.snapshot?.bindings.length ?? 0
     const label = count ? `WB ${count}` : "WB"
     return `
       <div class="pointer-events-auto p-1">
@@ -336,84 +347,50 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
       const badge = ok
         ? '<span class="text-[10px] px-1 rounded bg-emerald-500/15 text-emerald-700">OK</span>'
         : '<span class="text-[10px] px-1 rounded bg-rose-500/15 text-rose-700">Missing</span>'
-      return `
-        <div class="flex items-center justify-between gap-2">
-          <div class="min-w-0 flex items-center gap-2">
-            <span class="text-[11px] font-medium text-foreground/85">${htmlEscape(name)}</span>
-            ${badge}
-          </div>
-          <span class="min-w-0 truncate text-[10px] text-muted-foreground" title="${htmlEscape(version)}">${htmlEscape(version)}</span>
-        </div>
-      `
+      return `<div class="flex items-center gap-2 text-[11px]"><span class="font-medium text-foreground/90">${htmlEscape(
+        name,
+      )}</span>${badge}<span class="min-w-0 truncate text-[10px] text-muted-foreground" title="${htmlEscape(version)}">${htmlEscape(
+        version,
+      )}</span></div>`
     }
-    return `
-      <div class="grid gap-1">
-        ${row("git", snap.deps.git.ok, snap.deps.git.version)}
-        ${row("gh", snap.deps.gh.ok, snap.deps.gh.version)}
-        ${row("rsync", snap.deps.rsync.ok, snap.deps.rsync.version)}
-        ${row("tar", snap.deps.tar.ok, snap.deps.tar.version)}
-      </div>
-    `
+    return `<div class="grid gap-1">${row("git", snap.deps.git.ok, snap.deps.git.version)}${row("gh", snap.deps.gh.ok, snap.deps.gh.version)}</div>`
   }
 
-  function renderDetails(snap: Snapshot): string {
-    const cfg = snap.config
-    const cfgStatus =
-      cfg.status === "loaded" ? "Config loaded" : cfg.status === "invalid" ? "Config invalid" : "Config missing"
-    const cfgBadge =
-      cfg.status === "loaded"
-        ? '<span class="text-[10px] px-1 rounded bg-emerald-500/15 text-emerald-700">Loaded</span>'
-        : cfg.status === "invalid"
-          ? '<span class="text-[10px] px-1 rounded bg-rose-500/15 text-rose-700">Invalid</span>'
-          : '<span class="text-[10px] px-1 rounded bg-muted text-muted-foreground">Missing</span>'
-
-    const count = snap.sandboxes.length
-    const all = snap.sandboxesAllCount
-    const countLabel = all && all !== count ? `${count} (all=${all})` : String(count)
-
-    return `
-      <div class="text-[11px] text-muted-foreground leading-snug space-y-2">
-        <div class="space-y-1">
-          <div class="flex items-start gap-2">
-            <span class="shrink-0 font-medium text-foreground/80">Project:</span>
-            <span class="min-w-0 truncate" title="${htmlEscape(snap.projectRoot)}">${htmlEscape(
-              snap.projectRoot || "(unknown)",
-            )}</span>
-          </div>
-          <div class="flex items-center justify-between gap-2">
-            <div class="min-w-0 flex items-center gap-2">
-              <span class="shrink-0 font-medium text-foreground/80">Config:</span>
-              <span class="min-w-0 truncate" title="${htmlEscape(cfg.path)}">${htmlEscape(cfg.path)}</span>
-            </div>
-            <div class="shrink-0" title="${htmlEscape(cfgStatus)}">${cfgBadge}</div>
-          </div>
-          <div class="flex items-center gap-2">
-            <span class="font-medium text-foreground/80">Sandboxes:</span>
-            <span>${htmlEscape(countLabel)}</span>
-          </div>
-        </div>
-        <div class="rounded-md border border-border/40 bg-background/50 p-2">
-          <div class="pb-1 text-[11px] font-semibold text-foreground/85">Tooling</div>
-          ${renderDeps(snap)}
-        </div>
-      </div>
-    `
+  function renderInfo(snap: Snapshot): string {
+    const meta = [
+      snap.repo.commonDir ? `repo=${snap.repo.commonDir}` : "repo=(not detected)",
+      `scope=${snap.scope}`,
+      `session=${snap.sessionId || "(unknown)"}`,
+      snap.parentSessionId ? `parent=${snap.parentSessionId}` : "",
+      snap.childSessionId ? `child=${snap.childSessionId}` : "",
+      `bindings session=${snap.counts.session} repo=${snap.counts.repo} all=${snap.counts.all}`,
+    ]
+      .filter(Boolean)
+      .map((line) => `<div class="text-[11px] text-muted-foreground">${htmlEscape(line)}</div>`)
+      .join("")
+    return `<div class="flex flex-col gap-2">${renderDeps(snap)}<div class="grid gap-0.5">${meta}</div></div>`
   }
 
-  function renderSandboxes(snap: Snapshot): string {
-    const list = state.showAll ? snap.sandboxes : snap.sandboxes.slice(0, 6)
-    if (!list.length) {
-      return `<div class="px-2 py-2 text-center text-xs text-muted-foreground">No sandboxes found for this project.</div>`
+  function renderBindings(snap: Snapshot): string {
+    if (!snap.bindings.length) {
+      return snap.scope === "repo"
+        ? `<div class="px-2 py-2 text-center text-xs text-muted-foreground">No bindings found for this repo.</div>`
+        : `<div class="px-2 py-2 text-center text-xs text-muted-foreground">No binding found for this session.</div>`
     }
-    const rows = list
-      .map((s) => {
-        const pr = prId(s.prUrl)
-        const commit = shortHash(s.publishCommit)
+
+    const rows = snap.bindings
+      .slice(0, 8)
+      .map((b) => {
+        const pr = prId(b.prUrl)
+        const upstream = String(b.upstream || "").trim()
+        const fork = String(b.fork || "").trim()
         const suffix = [
-          s.branch ? `branch=${s.branch}` : "",
-          s.sessionId ? `session=${s.sessionId}` : "",
+          b.branch ? `branch=${b.branch}` : "",
+          b.sessionId ? `session=${b.sessionId}` : "",
+          b.parentSessionId ? `parent=${b.parentSessionId}` : "",
           pr ? `pr=${pr}` : "",
-          commit ? `commit=${commit}` : "",
+          upstream ? `up=${upstream}` : "",
+          fork ? `fork=${fork}` : "",
         ]
           .filter(Boolean)
           .join(" ")
@@ -421,7 +398,7 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
           <div class="rounded-md border border-border/40 bg-muted/10 px-2 py-1.5">
             <div class="flex items-center gap-2">
               <div class="min-w-0 flex-1">
-                <div class="text-[12px] font-semibold truncate" title="${htmlEscape(s.dir)}">${htmlEscape(s.name)}</div>
+                <div class="text-[12px] font-semibold truncate" title="${htmlEscape(b.dir)}">${htmlEscape(b.name)}</div>
                 <div class="text-[10px] text-muted-foreground truncate" title="${htmlEscape(suffix)}">${htmlEscape(suffix)}</div>
               </div>
               ${pr ? `<span class="text-[10px] px-1 rounded bg-primary/10 text-primary">#${htmlEscape(pr)}</span>` : ""}
@@ -431,11 +408,7 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
       })
       .join("")
 
-    const more = snap.sandboxes.length > 6
-      ? `<button type="button" data-wb-action="toggleAll" class="text-[11px] text-muted-foreground hover:text-foreground transition-colors">${state.showAll ? "Show less" : `Show all (${snap.sandboxes.length})`}</button>`
-      : ""
-
-    return `<div class="flex flex-col gap-1.5">${rows}${more ? `<div class="pt-0.5">${more}</div>` : ""}</div>`
+    return `<div class="flex flex-col gap-1.5">${rows}</div>`
   }
 
   function renderExpandedPanel(): string {
@@ -445,27 +418,38 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
       ? `<div class="rounded bg-destructive/10 px-2 py-1.5 text-xs text-destructive flex items-start gap-2"><span class="font-bold">Error:</span> ${htmlEscape(state.error)}</div>`
       : ""
 
-    const countBadge = snap
-      ? `<span class="text-[10px] px-1 rounded bg-primary/10 text-primary">${snap.sandboxes.length}</span>`
-      : ""
-
     const header = `
       <div class="flex items-center border-b border-border/30 bg-muted/20 gap-2 px-2 py-1">
         <div class="flex items-center gap-2 min-w-0 flex-1">
           <span class="truncate text-[11px] font-semibold text-foreground/90 select-none cursor-default" title="Workbench">Workbench</span>
-          ${countBadge}
+          <span class="text-[10px] px-1 rounded bg-muted text-muted-foreground">${htmlEscape(
+            state.scope === "repo" ? "repo" : "session",
+          )}</span>
           ${state.loading ? '<span class="animate-pulse text-[10px] text-muted-foreground">Updating...</span>' : ""}
         </div>
         <div class="flex items-center gap-0.5">
           <button
             type="button"
-            data-wb-action="details"
-            class="h-7 w-7 inline-flex items-center justify-center rounded ${state.detailsOpen ? "bg-muted/40" : "hover:bg-muted/40"}"
-            title="Details"
-            aria-label="Details"
-            aria-pressed="${state.detailsOpen}"
+            data-wb-action="scope"
+            class="h-7 px-2 inline-flex items-center justify-center rounded border border-border/50 bg-background/50 hover:bg-background hover:border-border/70 transition-colors text-[10px] text-muted-foreground"
+            title="Toggle scope"
+            aria-label="Toggle scope"
           >
-            ${iconSvg("help", "h-3.5 w-3.5 text-muted-foreground/80")}
+            ${htmlEscape(state.scope === "repo" ? "Session" : `Repo ${snap?.counts?.repo ? `(${snap.counts.repo})` : ""}`.trim())}
+          </button>
+          <button
+            type="button"
+            data-wb-action="info"
+            class="h-7 w-7 inline-flex items-center justify-center rounded border transition-colors ${
+              state.infoOpen
+                ? "border-border/70 bg-muted/50 text-foreground shadow-inner"
+                : "border-transparent text-muted-foreground hover:bg-muted/40"
+            }"
+            title="${state.infoOpen ? "Hide details" : "Show details"}"
+            aria-label="${state.infoOpen ? "Hide details" : "Show details"}"
+            aria-pressed="${state.infoOpen ? "true" : "false"}"
+          >
+            ${iconSvg("help", `h-3.5 w-3.5 ${state.infoOpen ? "text-foreground/90" : "text-muted-foreground/70"}`)}
           </button>
           <button
             type="button"
@@ -494,63 +478,27 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
       ? `<div class="py-2 text-center text-xs text-muted-foreground italic leading-relaxed">${state.loading ? "Checking workbench..." : "No data yet."}</div>`
       : `
           <div class="flex flex-col gap-2">
-            <div class="rounded-md border border-border/40 bg-background/50 p-2">
-              <div class="flex items-center gap-2 pb-1 text-[11px] font-semibold text-foreground/85">${iconSvg(
-                "list",
-                "h-4 w-4 text-muted-foreground/70",
-              )}<span>Sandboxes</span></div>
-              ${renderSandboxes(snap)}
-            </div>
-          </div>
-        `
-
-    const details = snap && state.detailsOpen
-      ? `
-          <div class="absolute inset-0">
-            <button
-              type="button"
-              data-wb-action="detailsClose"
-              class="absolute inset-0 bg-background/70 backdrop-blur-sm"
-              aria-label="Close details"
-            ></button>
-            <div class="absolute top-2 bottom-2 left-2 right-2">
-              <div class="pointer-events-auto w-full h-full rounded-lg border border-border/60 bg-background/95 shadow-xl backdrop-blur-md overflow-hidden flex flex-col">
-                <div class="flex items-center justify-between gap-2 border-b border-border/30 bg-muted/20 px-2 py-1">
-                  <div class="text-[11px] font-semibold text-foreground/90">Details</div>
-                  <button
-                    type="button"
-                    data-wb-action="detailsClose"
-                    class="h-7 w-7 inline-flex items-center justify-center rounded hover:bg-muted/40"
-                    title="Close"
-                    aria-label="Close"
-                  >
-                    ${iconSvg("x", "h-3.5 w-3.5 text-muted-foreground/80")}
-                  </button>
-                </div>
-                <div class="p-2 overflow-y-auto flex-1 min-h-0">
-                  ${renderDetails(snap)}
-                </div>
+            <div class="flex items-center justify-between gap-2">
+              <div class="flex items-center gap-2 text-[11px] font-semibold text-foreground/85">
+                ${iconSvg(state.infoOpen ? "help" : "list", "h-4 w-4 text-muted-foreground/70")}
+                <span>${htmlEscape(state.infoOpen ? "Info" : "Bindings")}</span>
               </div>
+              <span class="text-[10px] text-muted-foreground truncate">${htmlEscape(snap.repo.commonDir || "")}</span>
             </div>
+            ${state.infoOpen ? renderInfo(snap) : renderBindings(snap)}
           </div>
         `
-      : ""
-
-    const shellStyle = state.detailsOpen
-      ? "min-height: clamp(200px, 26vh, 280px); max-height: min(50vh, 420px);"
-      : "max-height: 50vh;"
 
     return `
       <section
         class="pointer-events-auto relative w-full rounded-lg border border-border/60 bg-background/95 shadow-xl backdrop-blur-md overflow-hidden transition-all duration-300 ease-in-out flex flex-col"
-        style="${shellStyle}"
+        style="max-height: 50vh;"
       >
         ${header}
         <div class="overflow-y-auto overscroll-contain flex-1 min-h-0 flex flex-col p-2 gap-2">
           ${body}
           ${errorBlock}
         </div>
-        ${details}
       </section>
     `
   }
@@ -575,20 +523,16 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
       toggleCollapsed()
       return
     }
-    if (action === "details") {
-      toggleDetails()
+    if (action === "scope") {
+      toggleScope()
       return
     }
-    if (action === "detailsClose") {
-      closeDetails()
+    if (action === "info") {
+      toggleInfo()
       return
     }
     if (action === "refresh") {
       scheduleRefresh(0)
-      return
-    }
-    if (action === "toggleAll") {
-      toggleAll()
     }
   }
 
