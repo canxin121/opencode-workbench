@@ -42,6 +42,7 @@ type Snapshot = {
     git: { ok: boolean; version: string }
     gh: { ok: boolean; version: string }
   }
+  workflowMode: "git+gh" | "git-only" | "no-git"
   projectRoot: string
   repo: {
     commonDir: string
@@ -102,7 +103,11 @@ type UiStrings = {
   noBindingSession: string
   repoNotDetected: string
   unknown: string
+  modeGitGh: string
+  modeGitOnly: string
+  modeNoGit: string
   metaRepo: (value: string) => string
+  metaMode: (value: string) => string
   metaScope: (value: string) => string
   metaSession: (value: string) => string
   metaParent: (value: string) => string
@@ -137,7 +142,11 @@ const UI_I18N: Record<LocaleCode, UiStrings> = {
     noBindingSession: "No binding found for this session.",
     repoNotDetected: "(not detected)",
     unknown: "(unknown)",
+    modeGitGh: "git+gh",
+    modeGitOnly: "git-only",
+    modeNoGit: "no-git",
     metaRepo: (value) => `repo=${value}`,
+    metaMode: (value) => `mode=${value}`,
     metaScope: (value) => `scope=${value}`,
     metaSession: (value) => `session=${value}`,
     metaParent: (value) => `parent=${value}`,
@@ -171,7 +180,11 @@ const UI_I18N: Record<LocaleCode, UiStrings> = {
     noBindingSession: "当前会话未找到绑定。",
     repoNotDetected: "（未检测到）",
     unknown: "（未知）",
+    modeGitGh: "git+gh",
+    modeGitOnly: "仅 git",
+    modeNoGit: "无 git",
     metaRepo: (value) => `仓库=${value}`,
+    metaMode: (value) => `模式=${value}`,
     metaScope: (value) => `范围=${value}`,
     metaSession: (value) => `会话=${value}`,
     metaParent: (value) => `父会话=${value}`,
@@ -246,6 +259,9 @@ function parseSnapshot(value: JsonValue): Snapshot | null {
   const depsObj = asObject(obj.deps)
   const repoObj = asObject(obj.repo)
   const countsObj = asObject(obj.counts)
+  const gitDep = parseDep(depsObj.git)
+  const ghDep = parseDep(depsObj.gh)
+  const workflowMode = parseWorkflowMode(obj.workflowMode, gitDep.ok, ghDep.ok)
   const bindings = asArray(obj.bindings)
     .map((row) => {
       const r = asObject(row)
@@ -281,9 +297,10 @@ function parseSnapshot(value: JsonValue): Snapshot | null {
       all: toNumber(countsObj.all),
     },
     deps: {
-      git: parseDep(depsObj.git),
-      gh: parseDep(depsObj.gh),
+      git: gitDep,
+      gh: ghDep,
     },
+    workflowMode,
     projectRoot: toStringValue(obj.projectRoot),
     repo: {
       commonDir: toStringValue(repoObj.commonDir),
@@ -301,6 +318,24 @@ function parseDep(value: JsonValue | undefined): { ok: boolean; version: string 
     ok: obj.ok === true,
     version: toStringValue(obj.version),
   }
+}
+
+function deriveWorkflowMode(gitOk: boolean, ghOk: boolean): Snapshot["workflowMode"] {
+  if (!gitOk) return "no-git"
+  if (ghOk) return "git+gh"
+  return "git-only"
+}
+
+function parseWorkflowMode(value: JsonValue | undefined, gitOk: boolean, ghOk: boolean): Snapshot["workflowMode"] {
+  const raw = toStringValue(value)
+  if (raw === "git+gh" || raw === "git-only" || raw === "no-git") return raw
+  return deriveWorkflowMode(gitOk, ghOk)
+}
+
+function workflowModeText(mode: Snapshot["workflowMode"], t: UiStrings): string {
+  if (mode === "git+gh") return t.modeGitGh
+  if (mode === "git-only") return t.modeGitOnly
+  return t.modeNoGit
 }
 
 function prId(url?: string): string {
@@ -477,6 +512,7 @@ export function mount(el: HTMLElement, opts: StudioMountOptions) {
   function renderInfo(snap: Snapshot): string {
     const meta = [
       t.metaRepo(snap.repo.commonDir || t.repoNotDetected),
+      t.metaMode(workflowModeText(snap.workflowMode, t)),
       t.metaScope(snap.scope),
       t.metaSession(snap.sessionId || t.unknown),
       snap.parentSessionId ? t.metaParent(snap.parentSessionId) : "",

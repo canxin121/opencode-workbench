@@ -49,8 +49,11 @@ async function main() {
 
   const createdSessions: string[] = []
   const promptCalls: any[] = []
+  const permissionReplies: any[] = []
+  const questionRejects: any[] = []
   const activePromptSessions = new Set<string>()
   const overlappedPromptSessions = new Set<string>()
+  let hooks: any
 
   const ctx: any = {
     directory: repo,
@@ -59,6 +62,18 @@ async function main() {
     serverUrl: "http://localhost",
     $: Bun.$,
     client: {
+      postSessionIdPermissionsPermissionId: async (input: any) => {
+        permissionReplies.push(input)
+        return { data: true }
+      },
+      _client: {
+        post: async (input: any) => {
+          if (input?.url === "/question/{requestID}/reject") {
+            questionRejects.push(input)
+          }
+          return { data: true }
+        },
+      },
       path: {
         get: async () => ({ data: { state } }),
       },
@@ -79,6 +94,33 @@ async function main() {
           promptCalls.push(input)
           const sessionID = String(input?.path?.id || "").trim()
           const bodyText = String(input?.body?.parts?.[0]?.text || "")
+          if (bodyText.includes("needs-permission")) {
+            await hooks?.event?.({
+              event: {
+                type: "permission.asked",
+                properties: {
+                  id: `perm_${promptCalls.length}`,
+                  sessionID,
+                  permission: "bash",
+                  patterns: ["*"],
+                  always: ["*"],
+                  metadata: {},
+                },
+              },
+            })
+          }
+          if (bodyText.includes("needs-question")) {
+            await hooks?.event?.({
+              event: {
+                type: "question.asked",
+                properties: {
+                  id: `question_${promptCalls.length}`,
+                  sessionID,
+                  questions: [],
+                },
+              },
+            })
+          }
           if (sessionID && activePromptSessions.has(sessionID)) {
             overlappedPromptSessions.add(sessionID)
           }
@@ -99,7 +141,7 @@ async function main() {
     },
   }
 
-  const hooks: any = await WorkbenchPlugin(ctx)
+  hooks = await WorkbenchPlugin(ctx)
   const def = hooks.tool.workbench
   const schema = tool.schema.object(def.args)
   const toolCtx: any = {
@@ -224,8 +266,11 @@ async function main() {
   if (taskParent.args.task_id !== workerSession) throw new Error("task auto-routing for supervisor failed")
 
   const taskChild = { args: { prompt: "p" } as Record<string, unknown> }
-  await before({ tool: "task", sessionID: workerSession, callID: "c_task_child" }, taskChild)
-  if (taskChild.args.task_id !== workerSession) throw new Error("task auto-routing for implementation session failed")
+  let childTaskBlocked = false
+  await before({ tool: "task", sessionID: workerSession, callID: "c_task_child" }, taskChild).catch(() => {
+    childTaskBlocked = true
+  })
+  if (!childTaskBlocked) throw new Error("built-in task should be blocked in implementation session")
 
   const taskByDirBlocked = {
     args: {
@@ -257,6 +302,9 @@ async function main() {
   if (!worktreeSession) throw new Error("workbench task output missing routed session id")
   const promptCall = promptCalls.at(-1)
   if (!promptCall || promptCall?.query?.directory !== workbenchDir) throw new Error("workbench task did not pin directory")
+  if (!promptCall || promptCall?.body?.agent !== toolCtx.agent) {
+    throw new Error("workbench task should inherit parent agent for child-session prompt")
+  }
 
   const toolCtxParent2 = { ...toolCtx, sessionID: "ses_parent_2" }
   const taskOut2 = await def.execute(
@@ -276,6 +324,44 @@ async function main() {
   const promptCall2 = promptCalls.at(-1)
   if (!promptCall2 || promptCall2?.path?.id !== worktreeSession2) throw new Error("workbench task should prompt in the re-parented session")
   if (!promptCall2 || promptCall2?.query?.directory !== workbenchDir) throw new Error("workbench task should keep the bound worktree directory")
+  if (!promptCall2 || promptCall2?.body?.agent !== toolCtxParent2.agent) {
+    throw new Error("workbench task should keep inheriting agent after re-parenting")
+  }
+
+  const taskWithPermissionAsk = await def.execute(
+    schema.parse({
+      action: "task",
+      prompt: "needs-permission",
+      dir: ".workbench/w2",
+    }),
+    toolCtxParent2,
+  )
+  if (!String(taskWithPermissionAsk).includes("task_permission_auto_rejects: 1")) {
+    throw new Error("workbench task should auto-reject child permission asks to avoid blocking")
+  }
+  const permissionReply = permissionReplies.at(-1)
+  if (!permissionReply || permissionReply?.path?.id !== worktreeSession2) {
+    throw new Error("auto-rejected permission should target the active child session")
+  }
+
+  const taskWithQuestionAsk = await def.execute(
+    schema.parse({
+      action: "task",
+      prompt: "needs-question",
+      dir: ".workbench/w2",
+    }),
+    toolCtxParent2,
+  )
+  if (!String(taskWithQuestionAsk).includes("task_question_auto_rejects: 1")) {
+    throw new Error("workbench task should auto-reject child questions to avoid blocking")
+  }
+  const questionReject = questionRejects.at(-1)
+  if (!questionReject || typeof questionReject?.path?.requestID !== "string") {
+    throw new Error("auto-rejected question should call question reject endpoint")
+  }
+  if (!questionReject.path.requestID.startsWith("question_")) {
+    throw new Error("auto-rejected question should call question reject endpoint")
+  }
 
   const taskParent2 = { args: { prompt: "p" } as Record<string, unknown> }
   await before({ tool: "task", sessionID: "ses_parent_2", callID: "c_task_parent2" }, taskParent2)

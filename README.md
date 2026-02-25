@@ -4,7 +4,7 @@ Lightweight bindings between git worktrees and OpenCode sessions for parallel de
 
 This plugin does **not** create sandboxes or sync files. Instead, it:
 
-- injects a prompt that guides the AI to use `git` and `gh` directly
+- injects prompts that treat `git` as the primary workflow and `gh` as an optional GitHub integration
 - records bindings (worktree dir, branch, session id, fork/upstream/PR metadata)
 - auto-routes built-in Task `task_id` in workbench supervisor/implementation sessions when unambiguous
 - provides a small Studio UI that shows your bindings (session-scoped by default)
@@ -46,7 +46,7 @@ Full help:
 workbench { action: "help" }
 ```
 
-Use this tool when you need parallel work across branches/worktrees (git worktree, GitHub fork, multiple branches at once).
+Use this tool when you need parallel work across branches/worktrees (git worktree, optional GitHub fork, multiple branches at once).
 
 Note: `bind`, `open`, and `task` require a real git repository/worktree. If git is not detected, workbench returns an error that tells the AI/user to initialize or create a repo first (for example `git init`).
 
@@ -58,7 +58,7 @@ Actions:
   - validates `prUrl` as `https://<host>/<owner>/<repo>/pull/<number>`
   - supports metadata clearing via `clear: "prUrl"` or `clear: "github"`
 - `open`: create/reuse a pinned child session for a binding
-- `task`: run a prompt in a routed workbench session (optionally by `dir` or `task_id`)
+- `task`: run a prompt in a routed workbench session (optionally by `dir` or `task_id`); child prompt agent is inherited from the parent session and child permission/question requests are auto-rejected during relayed runs
 - `list`: list bindings (defaults to current session; use `scope: "repo"` for repo)
 - `info`: show a binding (defaults to current session)
 - `remove`: remove a binding (defaults to current session)
@@ -91,14 +91,21 @@ Suggested governance workflow:
 - Supervisor should not edit child implementation files directly; route file work to child sessions.
 - Build/check/fmt/test should run in the target child worktree session (not supervisor) to avoid wrong-directory execution.
 - If changes are in child worktrees, supervisor-local build/check/fmt/test is usually meaningless and should be skipped.
-- Child sessions run their own `git commit`, `git push`, and `gh pr merge`.
+- Child sessions run their own `git commit`/`git push`; local merge delivery works with `git` only.
+- If GitHub integration is needed, require `gh` installation/authentication first, then run `gh` PR/check/merge steps.
 - Child reports readiness with suggested next delivery steps; supervisor decides routing.
-- For commit/push/PR/merge/cleanup milestones, supervisor should proactively confirm user approval and require green PR checks/GitHub Actions before merge; if checks fail, route fixes back to child.
+- For commit/push/PR/merge/cleanup milestones, supervisor should proactively confirm user approval and require green checks before merge; for local-only flow use git evidence, and for GitHub-linked flow require authenticated `gh` status/checks.
 - Unless user approval is already explicit/preapproved, supervisor should ask before each next delivery/cleanup step and, after each step result, ask whether to continue.
 - User may preapprove those delivery actions; supervisor should restate the approval in the prompt flow.
 - Prefer child-session reuse (`open/list/info` first) and only create new child sessions when necessary.
 - For cleanup actions (binding removal, storage cleanup, remote branch cleanup), supervisor should confirm with the user first unless already requested.
 - For cold-start heavy stacks, supervisor should decide and coordinate safe cache seeding into new worktrees (for example `node_modules`, `cargo target`, or other tool caches) when compatible.
+
+Optional GitHub CLI modes:
+
+- git-only baseline: keep the full local parallel->merge flow in git.
+- With `gh`: optionally route GitHub PR creation/status/merge checks through `gh` in child sessions.
+- Without `gh` (for GitHub-linked work): pause those GitHub milestones and install/authenticate `gh` first.
 
 ## Configuration
 
@@ -132,11 +139,11 @@ workbench { action: "open", dir: ".workbench/feature-x", name: "feature-x" }
 
 Suggested split:
 
-- Keep the top-level session focused on orchestration (`git`, `gh`, `workbench`) when running parallel branches.
+- Keep the top-level session focused on orchestration (`git`, optional `gh`, `workbench`) when running parallel branches.
 - Run implementation prompts with `workbench { action: "task", ... }` so routing stays worktree-aware.
 
 ```text
-workbench { action: "task", dir: ".workbench/feature-x", prompt: "Implement feature", agent: "general" }
+workbench { action: "task", dir: ".workbench/feature-x", prompt: "Implement feature" }
 ```
 
 If you need explicit parent+child visibility in supervisor workflows:
@@ -185,4 +192,4 @@ workbench { action: "remove", name: "my-thing" }
 
 - `workbench` intentionally keeps file operations out of scope (metadata + binding only).
 - Use `workbench { action: "task", ... }` for directory-aware implementation prompts in bound worktrees.
-- Use `git worktree`, `git switch`, `git push`, and `gh pr create/edit` directly for git/GitHub workflows.
+- Use `git worktree`, `git switch`, and `git push` directly for local flow; if needed, use `gh pr create/edit` as optional GitHub integration.

@@ -37,6 +37,7 @@ type BridgeContext = {
 }
 
 type Scope = "session" | "repo" | "all"
+type ToolingMode = "git+gh" | "git-only" | "no-git"
 
 type Entry = {
   version: 1
@@ -175,6 +176,12 @@ function checkCmd(cmd: string): { ok: boolean; version: string } {
   return { ok, version: text.split("\n")[0] ?? "" }
 }
 
+function toolingModeFromDeps(deps: { git: { ok: boolean }; gh: { ok: boolean } }): ToolingMode {
+  if (!deps.git.ok) return "no-git"
+  if (deps.gh.ok) return "git+gh"
+  return "git-only"
+}
+
 function gitShowTopLevel(cwd: string): string {
   const res = runCmd(["git", "-C", cwd, "rev-parse", "--show-toplevel"])
   if (res.exitCode !== 0) return ""
@@ -293,6 +300,7 @@ async function snapshot(payload: unknown, context: BridgeContext) {
     git: checkCmd("git"),
     gh: checkCmd("gh"),
   }
+  const workflowMode = toolingModeFromDeps(deps)
 
   const sessionId = payloadSession || String(context.sessionId || "").trim()
   const parentSessionId = payloadParentSession || String(context.parentSessionId || "").trim() || sessionId
@@ -377,6 +385,7 @@ async function snapshot(payload: unknown, context: BridgeContext) {
     cwd,
     base,
     deps,
+    workflowMode,
     projectRoot,
     scope,
     counts: {

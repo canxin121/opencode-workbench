@@ -17,10 +17,15 @@ const HELP = `opencode-workbench (tool: workbench)
 
 Purpose
 - Lightweight registry for binding git worktrees to OpenCode sessions.
-- This tool does NOT create worktrees, remotes, or PRs. Use git + gh directly.
+- This tool does NOT create worktrees, remotes, or PRs. Use git directly for local branch/worktree delivery; use gh only as an optional GitHub integration.
 - Requires a git repository/worktree; non-git directories are rejected.
 - Records metadata (worktree path, branch, fork, PR URL) so OpenCode Studio UI can display it.
 - Includes a task action for directory-aware subagent execution in bound worktrees.
+
+Delivery modes
+- git-only mode (baseline): core local parallel flow (worktree/commit/merge) runs with git only.
+- git+gh mode (optional): add gh commands when you want GitHub PR/check/merge integration.
+- GitHub-integrated PR/check/merge steps require gh to be installed and authenticated.
 
 When to use
 - Use workbench when multiple branches/worktrees are active in parallel and you need explicit task routing.
@@ -33,11 +38,14 @@ Common workflow
 3) Bind + open a pinned session:
    workbench { action: "open", dir: ".workbench/feature-x", name: "feature-x" }
 4) Use workbench task when you want implementation work routed to a specific worktree session.
-   workbench { action: "task", dir: ".workbench/feature-x", prompt: "Implement feature", agent: "general" }
+   workbench { action: "task", dir: ".workbench/feature-x", prompt: "Implement feature" }
    (task_id auto-routes when possible)
+   (task always inherits the parent session agent)
 5) Update GitHub metadata (optional):
    workbench { action: "bind", prUrl: "https://..." }
-6) Before merge, ensure PR checks/GitHub Actions are green, then ask user approval for merge.
+6) Before merge, ensure checks are green and ask user approval for merge.
+   - In git-only mode, complete local integration with git commands (for example merge/rebase/cherry-pick).
+   - In git+gh mode, ensure gh is installed/authenticated, then sync GitHub PR/CI status with gh.
 
 Actions
 - help: show this help text
@@ -49,8 +57,11 @@ Actions
   - supports clear="prUrl" or clear="github" (comma/space-separated)
 - open: create/reuse a pinned child session for a binding
 - task: run a prompt in a routed/pinned workbench session
+  - inherits parent session agent for child-session prompts
+  - auto-rejects child permission/question requests during relayed runs to avoid blocked tool calls
   (concurrent calls to the same target session are serialized to avoid response cross-talk)
   (output includes task_queue_ms/task_run_ms/task_queued)
+  (output may include task_permission_auto_rejects/task_question_auto_rejects)
 - remove: delete a binding (default: current session)
 
 Scopes (for list)
@@ -66,7 +77,7 @@ Session targeting
 Role policy
 - Role-specific workflow rules are injected automatically for supervisor and implementation sessions.
 - Supervisor owns orchestration and can decide safe cache/artifact seeding for new worktrees when useful.
-- Implementation sessions execute and verify inside their bound worktree, then report readiness and CI status.
+- Implementation sessions execute and verify inside their bound worktree, then report readiness and check status.
 
 Storage
 - Registry files live under: $XDG_STATE_HOME/opencode/workbench/entries/
@@ -74,17 +85,32 @@ Storage
 
 const SUPERVISOR_HINT = `Workbench mode: this is a supervisor session.
 - Own orchestration only: planning, routing, review, and user communication.
-- MUST NOT edit child implementation files or run build/check/fmt/test/git/gh for child-worktree changes in this session.
+- MUST NOT edit child implementation files or run build/check/fmt/test/git for child-worktree changes in this session.
 - Route child implementation changes (feature/code/file work) and verification commands to the target child session, and collect results there.
 - For new/heavy worktrees, proactively decide language/tool-specific acceleration (for example seeding node_modules, cargo target, or other reusable caches) when safe for this repo.
-- Delivery flow (commit -> push -> PR -> merge -> cleanup): first collect child readiness + CI/GitHub Actions status, and do not move toward merge unless checks are green.
+- Distinguish delivery paths: git-only local integration uses git worktree + git merge/rebase/cherry-pick; GitHub-integrated delivery uses gh for PR/check/merge.
+- If GitHub-integrated steps are requested, require gh installation + authentication (for example gh auth login) before continuing those steps.
 - Unless user approval is already explicit/preapproved, ask before each next step; after each completed step, report outcome and ask whether to continue.`
 
 const IMPLEMENTATION_HINT = `Workbench mode: this session is pinned to a workbench worktree.
-- Execute all implementation and repo actions for this worktree (edits/build/check/fmt/test/git/gh) only inside this path.
-- Delivery flow (commit -> push -> PR -> merge -> cleanup): execute only the step requested by supervisor.
-- After push/PR, check CI/GitHub Actions and report status; if checks fail, fix in this session and rerun.
-- Merge/delivery only when checks are green and supervisor confirms user approval (unless already explicitly preapproved).`
+- Execute all implementation and repo actions for this worktree (edits/build/check/fmt/test/git) only inside this path.
+- For git-only local delivery, use git integration commands (for example merge/rebase/cherry-pick) in local worktrees; do not depend on gh.
+- For GitHub-integrated delivery, use gh for PR/check/merge only after gh is installed and authenticated.
+- Execute only the step requested by supervisor, and report readiness/check status before merge or final delivery.`
+
+const TOOLING_MODE_HINT = `Workbench tooling policy (always apply):
+- Git is the required baseline for local parallel development and merge workflow.
+- gh is optional; use it only when the user wants GitHub-integrated PR/check/merge actions.
+- If a GitHub-integrated step is requested and gh is missing, require installation + authentication (for example gh auth login) before continuing that step.
+- If the user only wants local git delivery, continue with git-only flow without gh.`
+
+type ToolingMode = "git+gh" | "git-only" | "no-git"
+
+function toolingModeFrom(hasGit: boolean, hasGh: boolean): ToolingMode {
+  if (!hasGit) return "no-git"
+  if (hasGh) return "git+gh"
+  return "git-only"
+}
 
 type Entry = {
   version: 1
@@ -138,6 +164,44 @@ function taskText(response: unknown) {
     if (type === "text" && typeof text === "string") return text
   }
   return ""
+}
+
+function messageAgent(response: unknown) {
+  if (!response || typeof response !== "object") return ""
+  const info = (response as { info?: unknown }).info
+  if (!info || typeof info !== "object") return ""
+  const record = info as Record<string, unknown>
+  if (record.role !== "user") return ""
+  if (typeof record.agent !== "string") return ""
+  return record.agent.trim()
+}
+
+async function parentAgent(ctx: any, toolCtx: any, parentSessionId: string) {
+  const direct = sessionArg(toolCtx?.agent)
+  if (direct) return direct
+
+  const parent = sessionArg(parentSessionId) || sessionArg(toolCtx?.sessionID)
+  if (!parent) {
+    throw new Error("workbench: cannot inherit agent because no parent session id is available")
+  }
+
+  const list = ctx?.client?.session?.messages
+  if (typeof list !== "function") {
+    throw new Error("workbench: cannot inherit agent because session messages API is unavailable")
+  }
+
+  const response = await list({ path: { id: parent }, query: { limit: 100 } }).catch(() => undefined)
+  const messages = unwrap<any>(response ?? [])
+  if (Array.isArray(messages)) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const match = messageAgent(messages[i])
+      if (match) return match
+    }
+  }
+
+  throw new Error(
+    `workbench: cannot inherit agent from parent session ${JSON.stringify(parent)}. Send a parent message first, then retry.`,
+  )
 }
 
 const clean = (input: string) =>
@@ -333,6 +397,132 @@ function mergeGithubMetadata(
     ...(upstream ? { upstream } : {}),
     ...(fork ? { fork } : {}),
     ...(prUrl ? { prUrl } : {}),
+  }
+}
+
+const relayTaskDepth = new Map<string, number>()
+const relayTaskRejects = new Map<string, { permission: number; question: number }>()
+
+function relayTaskEnter(sessionID: string) {
+  const sid = sessionArg(sessionID)
+  if (!sid) return
+  relayTaskDepth.set(sid, (relayTaskDepth.get(sid) ?? 0) + 1)
+}
+
+function relayTaskLeave(sessionID: string) {
+  const sid = sessionArg(sessionID)
+  if (!sid) return
+  const next = (relayTaskDepth.get(sid) ?? 0) - 1
+  if (next > 0) {
+    relayTaskDepth.set(sid, next)
+    return
+  }
+  relayTaskDepth.delete(sid)
+}
+
+function relayTaskActive(sessionID: string) {
+  const sid = sessionArg(sessionID)
+  if (!sid) return false
+  return (relayTaskDepth.get(sid) ?? 0) > 0
+}
+
+function relayTaskRejectSnapshot(sessionID: string) {
+  const sid = sessionArg(sessionID)
+  if (!sid) return { permission: 0, question: 0 }
+  return relayTaskRejects.get(sid) ?? { permission: 0, question: 0 }
+}
+
+function relayTaskRejectBump(sessionID: string, kind: "permission" | "question") {
+  const sid = sessionArg(sessionID)
+  if (!sid) return
+  const current = relayTaskRejects.get(sid) ?? { permission: 0, question: 0 }
+  const next = {
+    permission: current.permission + (kind === "permission" ? 1 : 0),
+    question: current.question + (kind === "question" ? 1 : 0),
+  }
+  relayTaskRejects.set(sid, next)
+}
+
+async function relayTaskRejectPermission(ctx: any, sessionID: string, requestID: string) {
+  const reject = ctx?.client?.postSessionIdPermissionsPermissionId
+  if (typeof reject !== "function") return false
+  await reject({
+    path: {
+      id: sessionID,
+      permissionID: requestID,
+    },
+    body: {
+      response: "reject",
+    },
+  }).catch(() => undefined)
+  return true
+}
+
+async function relayTaskRejectQuestion(ctx: any, requestID: string) {
+  const reject = ctx?.client?.question?.reject
+  if (typeof reject === "function") {
+    await reject({
+      path: {
+        requestID,
+      },
+    }).catch(() => undefined)
+    return true
+  }
+
+  const raw = ctx?.client?._client?.post
+  if (typeof raw !== "function") return false
+  await raw({
+    url: "/question/{requestID}/reject",
+    path: {
+      requestID,
+    },
+  }).catch(() => undefined)
+  return true
+}
+
+async function relayTaskAbortSession(ctx: any, sessionID: string) {
+  const abort = ctx?.client?.session?.abort
+  if (typeof abort !== "function") return false
+  await abort({
+    path: {
+      id: sessionID,
+    },
+  }).catch(() => undefined)
+  return true
+}
+
+async function relayTaskHandleEvent(ctx: any, event: unknown) {
+  if (!event || typeof event !== "object") return
+  const record = event as Record<string, unknown>
+  const type = typeof record.type === "string" ? record.type : ""
+  if (!type) return
+  const properties = record.properties
+  if (!properties || typeof properties !== "object") return
+  const props = properties as Record<string, unknown>
+  const sessionID = sessionArg(props.sessionID)
+  if (!sessionID || !relayTaskActive(sessionID)) return
+
+  if (type === "permission.asked" || type === "permission.updated") {
+    const requestID = sessionArg(props.id)
+    if (!requestID) return
+    const handled = await relayTaskRejectPermission(ctx, sessionID, requestID)
+    if (!handled) {
+      await relayTaskAbortSession(ctx, sessionID)
+      return
+    }
+    relayTaskRejectBump(sessionID, "permission")
+    return
+  }
+
+  if (type === "question.asked") {
+    const requestID = sessionArg(props.id)
+    if (!requestID) return
+    const handled = await relayTaskRejectQuestion(ctx, requestID)
+    if (!handled) {
+      await relayTaskAbortSession(ctx, sessionID)
+      return
+    }
+    relayTaskRejectBump(sessionID, "question")
   }
 }
 
@@ -893,21 +1083,26 @@ async function resolveSessionMode(base: string, sessionID?: string) {
 
 export const WorkbenchPlugin: Plugin = async (ctx) => {
   return {
+    event: async (input) => {
+      await relayTaskHandleEvent(ctx, input.event)
+    },
     "experimental.chat.system.transform": async (input, output) => {
+      const sessionMode = await resolveSessionMode(stateHome(), input.sessionID)
       output.system.push(INJECTION)
-      const mode = await resolveSessionMode(stateHome(), input.sessionID)
-      if (mode === "supervisor") output.system.push(SUPERVISOR_HINT)
-      if (mode === "implementation") output.system.push(IMPLEMENTATION_HINT)
+      output.system.push(TOOLING_MODE_HINT)
+      if (sessionMode === "supervisor") output.system.push(SUPERVISOR_HINT)
+      if (sessionMode === "implementation") output.system.push(IMPLEMENTATION_HINT)
     },
     "experimental.session.compacting": async (input, output) => {
+      const sessionMode = await resolveSessionMode(stateHome(), input.sessionID)
       output.context.push(INJECTION)
-      const mode = await resolveSessionMode(stateHome(), input.sessionID)
-      if (mode === "supervisor") output.context.push(SUPERVISOR_HINT)
-      if (mode === "implementation") output.context.push(IMPLEMENTATION_HINT)
+      output.context.push(TOOLING_MODE_HINT)
+      if (sessionMode === "supervisor") output.context.push(SUPERVISOR_HINT)
+      if (sessionMode === "implementation") output.context.push(IMPLEMENTATION_HINT)
     },
     "tool.definition": async (input, output) => {
       if (input.toolID !== "task") return
-      output.description = `${output.description}\n\nWorkbench note:\n- workbench is for concurrent branch/worktree tasks.\n- For directory-aware execution, use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.\n- In workbench supervisor/implementation sessions, built-in task directory input is disabled; workbench can auto-route task_id when unambiguous.`
+      output.description = `${output.description}\n\n${INJECTION}`
     },
     "tool.execute.before": async (input, output) => {
       const base = stateHome()
@@ -918,11 +1113,16 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
 
         const mode = await resolveSessionMode(base, input.sessionID)
         if (mode === "default") return
+        if (mode === "implementation") {
+          throw new Error(
+            'workbench: built-in task is disabled in child implementation sessions. Execute work directly in this child session, or delegate from the supervisor via workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.',
+          )
+        }
 
         const raw = directoryArg(args)
         if (raw) {
           throw new Error(
-            'workbench: built-in task directory is disabled in supervisor/implementation mode. Use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.',
+            'workbench: built-in task directory is disabled in supervisor mode. Use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.',
           )
         }
 
@@ -1034,7 +1234,11 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
             .boolean()
             .optional()
             .describe("when action=info and multiple bindings match, throw instead of auto-picking the latest"),
-          agent: tool.schema.string().optional().describe('when action=task, agent name (default: "general")'),
+          agent: tool
+            .schema
+            .string()
+            .optional()
+            .describe("when action=task, compatibility field; effective agent is inherited from the parent session"),
           command: tool.schema.string().optional().describe("when action=task, optional command trigger text"),
           force: tool.schema.boolean().optional().describe("when action=open, always create a new session"),
         },
@@ -1054,6 +1258,7 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
             }
 
             const sessionID = parentSessionId
+            const inheritedAgent = await parentAgent(ctx, toolCtx, sessionID)
             const cwd = path.resolve(String(toolCtx?.directory || ctx.directory || "").trim() || process.cwd())
             const byDirInput = (args.dir ?? "").trim()
 
@@ -1090,25 +1295,39 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
             const prompt = (args.command ?? "").trim()
               ? `[command trigger]\n${(args.command ?? "").trim()}\n\n${promptText}`
               : promptText
+            const rejectBefore = relayTaskRejectSnapshot(routed)
 
             const taskRun = await runSessionTaskSerial(routed, async () =>
-              await ctx.client.session.prompt({
-                path: { id: routed },
-                query: { directory: dir },
-                body: {
-                  agent: (args.agent ?? "").trim() || "general",
-                  parts: [{ type: "text", text: prompt }],
-                },
-              }),
+              await (async () => {
+                relayTaskEnter(routed)
+                try {
+                  return await ctx.client.session.prompt({
+                    path: { id: routed },
+                    query: { directory: dir },
+                    body: {
+                      agent: inheritedAgent,
+                      parts: [{ type: "text", text: prompt }],
+                    },
+                  })
+                } finally {
+                  relayTaskLeave(routed)
+                }
+              })(),
             )
             const data = unwrap<any>(taskRun.value)
             const text = taskText(data)
+            const rejectAfter = relayTaskRejectSnapshot(routed)
+            const permissionRejects = Math.max(0, rejectAfter.permission - rejectBefore.permission)
+            const questionRejects = Math.max(0, rejectAfter.question - rejectBefore.question)
 
             return [
               `task_id: ${routed} (for resuming this workbench task if needed)`,
+              `agent: ${inheritedAgent} (inherited from parent session)`,
               `task_queue_ms: ${taskRun.queuedMs}`,
               `task_run_ms: ${taskRun.runMs}`,
               `task_queued: ${taskRun.queued ? "yes" : "no"}`,
+              ...(permissionRejects > 0 ? [`task_permission_auto_rejects: ${permissionRejects}`] : []),
+              ...(questionRejects > 0 ? [`task_question_auto_rejects: ${questionRejects}`] : []),
               "",
               "<task_result>",
               text,
@@ -1119,6 +1338,7 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
           if (args.action === "doctor") {
             const git = Bun.which("git")
             const gh = Bun.which("gh")
+            const mode = toolingModeFrom(Boolean(git), Boolean(gh))
             const cwd = path.resolve(String(toolCtx?.directory || ctx.directory || "").trim() || process.cwd())
             const dir = (args.dir ?? "").trim()
             const target = dir
@@ -1126,11 +1346,16 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
                 ? path.resolve(dir)
                 : path.resolve(cwd, dir)
               : cwd
-            const repo = await detectRepo(ctx, cwd)
             return [
               "workbench: doctor",
               `- base: ${base}`,
               `- tools: git=${git ? "ok" : "missing"} gh=${gh ? "ok" : "missing"}`,
+              `- workflow mode: ${mode}`,
+              ...(mode === "git-only"
+                ? ["- mode note: gh is optional for local git-only flow. For GitHub-linked PR/check/merge steps, install + authenticate gh (for example gh auth login)."]
+                : mode === "no-git"
+                  ? ["- mode note: git is missing; install git before bind/open/task actions can work."]
+                  : []),
               `- session: ${String(toolCtx?.sessionID || "").trim() || "(unknown)"}`,
               `- cwd: ${target}`,
               `- git common dir: ${(await detectRepo(ctx, target)).commonDir || "(not detected)"}`,
@@ -1327,10 +1552,14 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
               })
 
               if ((args.prompt ?? "").trim()) {
+                const inheritedAgent = await parentAgent(ctx, toolCtx, parentSessionId)
                 await ctx.client.session.promptAsync({
                   path: { id: session.id },
                   query: { directory: updated.worktree.path },
-                  body: { parts: [{ type: "text", text: args.prompt!.trim() }] },
+                  body: {
+                    agent: inheritedAgent,
+                    parts: [{ type: "text", text: args.prompt!.trim() }],
+                  },
                 })
               }
 
