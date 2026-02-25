@@ -1,6 +1,6 @@
 {
   "name": "opencode-workbench",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Branch sandboxes for parallel OpenCode development",
   "type": "module",
   "opencodeStudio": {

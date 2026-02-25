@@ -78,7 +78,8 @@ Session targeting
 
 Role policy
 - Role-specific workflow rules are injected automatically for supervisor and implementation sessions.
-- Supervisor primarily owns orchestration and can decide safe cache/artifact seeding for new worktrees when useful.
+- Supervisor sessions are orchestration-only: direct implementation tools (read/glob/grep/edit/write/apply_patch/bash) must be delegated to child sessions.
+- Supervisor can decide safe cache/artifact seeding for new worktrees when useful.
 - Implementation sessions usually execute in their bound worktree, and may cross paths when required by the task and allowed by agent policy.
 - Child-session workbench tasks inherit the parent session agent, so routing and permissions stay aligned.
 
@@ -88,8 +89,10 @@ Storage
 
 const SUPERVISOR_HINT = `Workbench mode: this is a supervisor session.
 - Primary owner of orchestration: planning, routing, review, and user communication.
-- Direct reads/edits/build/check/fmt/test/git are allowed when needed and when the active agent policy permits them.
-- Prefer routing implementation-heavy code/file changes and verification commands to the target child session for clearer ownership.
+- Do not directly perform repository implementation work in this session: no direct read/glob/grep/edit/write/apply_patch/bash for code changes, investigation, build/check/fmt/test, or git delivery tasks.
+- Delegate implementation/debug/verification to child worktree sessions via workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.
+- If no suitable child session exists, open one first with workbench { action: "open", ... }, then delegate.
+- Keep the supervisor loop strict: assign task -> wait for child result -> review -> send follow-up child task or report to user.
 - For new/heavy worktrees, proactively decide language/tool-specific acceleration (for example seeding node_modules, cargo target, or other reusable caches) when safe for this repo.
 - Distinguish delivery paths: git-only local integration uses git worktree + git merge/rebase/cherry-pick; GitHub-integrated delivery uses gh for PR/check/merge.
 - If GitHub-integrated steps are requested, require gh installation + authentication (for example gh auth login) before continuing those steps.
@@ -1069,8 +1072,8 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
       if (input.tool === "task") {
         if (!output.args || typeof output.args !== "object" || Array.isArray(output.args)) return
         const args = output.args as Record<string, unknown>
-
         const mode = await resolveSessionMode(base, input.sessionID)
+
         if (mode === "default") return
         if (mode === "implementation") {
           throw new Error(

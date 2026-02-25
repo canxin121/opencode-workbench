@@ -142,6 +142,11 @@ async function main() {
   }
 
   hooks = await WorkbenchPlugin(ctx)
+  const systemTransform = hooks["experimental.chat.system.transform"] as
+    | ((input: { sessionID: string }, output: { system: string[] }) => Promise<void>)
+    | undefined
+  if (!systemTransform) throw new Error("system transform hook missing")
+
   const def = hooks.tool.workbench
   const schema = tool.schema.object(def.args)
   const toolCtx: any = {
@@ -159,6 +164,24 @@ async function main() {
   await def.execute(schema.parse({ action: "open", name, dir: repo }), toolCtx)
   const workerSession = createdSessions[0]
   if (!workerSession) throw new Error("open did not create worker session")
+
+  const supervisorSystem = { system: [] as string[] }
+  await systemTransform({ sessionID: "ses_parent" }, supervisorSystem)
+  const supervisorSystemText = supervisorSystem.system.join("\n")
+  if (!supervisorSystemText.includes("Do not directly perform repository implementation work in this session")) {
+    throw new Error("supervisor system prompt should forbid direct implementation tools")
+  }
+  if (!supervisorSystemText.includes("Delegate implementation/debug/verification to child worktree sessions")) {
+    throw new Error("supervisor system prompt should require child-session delegation")
+  }
+
+  const implementationSystem = { system: [] as string[] }
+  await systemTransform({ sessionID: workerSession }, implementationSystem)
+  const implementationSystemText = implementationSystem.system.join("\n")
+  if (!implementationSystemText.includes("Workbench mode: this session is pinned to a workbench worktree.")) {
+    throw new Error("implementation system prompt should be injected for child sessions")
+  }
+
   const listRepo = await def.execute(schema.parse({ action: "list", scope: "repo" }), toolCtx)
   if (!String(listRepo).includes(name)) throw new Error("repo list did not include binding")
   const listSupervisor = await def.execute(schema.parse({ action: "list" }), toolCtx)
@@ -425,11 +448,14 @@ async function main() {
   const removeMissing = await def.execute(schema.parse({ action: "remove", name: "missing", dir: repo }), toolCtx)
   if (!String(removeMissing).includes("binding not found")) throw new Error("remove missing binding should be explicit")
 
-  const editAnyAllowed = { args: { filePath: path.join(repo, "README.md") } as Record<string, unknown> }
-  await before({ tool: "edit", sessionID: "ses_parent", callID: "c_edit_deny" }, editAnyAllowed)
+  const supervisorReadAllowedArgs = { args: { filePath: path.join(repo, "README.md") } as Record<string, unknown> }
+  await before({ tool: "read", sessionID: "ses_parent", callID: "c_read_supervisor" }, supervisorReadAllowedArgs)
 
-  const editAllowed = { args: { filePath: path.join(repo, ".gitignore") } as Record<string, unknown> }
-  await before({ tool: "edit", sessionID: "ses_parent", callID: "c_edit_allow" }, editAllowed)
+  const supervisorEditAllowedArgs = { args: { filePath: path.join(repo, ".gitignore") } as Record<string, unknown> }
+  await before({ tool: "edit", sessionID: "ses_parent", callID: "c_edit_supervisor" }, supervisorEditAllowedArgs)
+
+  const supervisorBashAllowedArgs = { args: { command: "git status" } as Record<string, unknown> }
+  await before({ tool: "bash", sessionID: "ses_parent", callID: "c_bash_supervisor" }, supervisorBashAllowedArgs)
 
   await def.execute(schema.parse({ action: "bind", prUrl: "https://github.com/org/repo/pull/1" }), toolCtxChild)
   const infoSession = await def.execute(schema.parse({ action: "info" }), toolCtxChild)

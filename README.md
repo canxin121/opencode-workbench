@@ -7,6 +7,7 @@ This plugin does **not** create sandboxes or sync files. Instead, it:
 - injects prompts that treat `git` as the primary workflow and `gh` as an optional GitHub integration
 - records bindings (worktree dir, branch, session id, fork/upstream/PR metadata)
 - auto-routes built-in Task `task_id` in workbench supervisor/implementation sessions when unambiguous
+- strongly emphasizes supervisor-to-child delegation for implementation work
 - provides a small Studio UI that shows your bindings (session-scoped by default)
 - enforces git-only directories for bind/open/task (non-git dirs are rejected with guidance)
 
@@ -88,7 +89,7 @@ Task isolation:
 Suggested governance workflow:
 
 - Supervisor session focuses on orchestration; child sessions do implementation.
-- Supervisor should not edit child implementation files directly; route file work to child sessions.
+- Supervisor should avoid direct implementation tools and route code/file/build/test/git work to child sessions.
 - Build/check/fmt/test should run in the target child worktree session (not supervisor) to avoid wrong-directory execution.
 - If changes are in child worktrees, supervisor-local build/check/fmt/test is usually meaningless and should be skipped.
 - Child sessions run their own `git commit`/`git push`; local merge delivery works with `git` only.
@@ -153,6 +154,8 @@ workbench { action: "list", scope: "session", parentSessionId: "ses_parent", ses
 ```
 
 In workbench supervisor/implementation sessions, built-in `task` with `directory` is blocked; use `workbench { action: "task", ... }` instead.
+
+In workbench supervisor sessions, prefer delegation over direct implementation tool calls: use `workbench { action: "task", ... }`.
 
 If routing is ambiguous, get session id and pass `task_id` explicitly:
 
