@@ -8,6 +8,7 @@ const INJECTION = `Use workbench for concurrent branch/worktree tasks.
 
 - workbench binds a worktree directory to a pinned OpenCode session and stores metadata for Studio.
 - Use it when multiple tasks/branches run in parallel and you need clear per-worktree routing.
+- workbench manages routing/context metadata; path, file, and tool permissions are governed by the active agent policy.
 
 Help: workbench { action: "help" }`
 
@@ -21,6 +22,7 @@ Purpose
 - Requires a git repository/worktree; non-git directories are rejected.
 - Records metadata (worktree path, branch, fork, PR URL) so OpenCode Studio UI can display it.
 - Includes a task action for directory-aware subagent execution in bound worktrees.
+- workbench routing does not replace agent authorization; path/file/build permissions follow the active agent policy.
 
 Delivery modes
 - git-only mode (baseline): core local parallel flow (worktree/commit/merge) runs with git only.
@@ -76,27 +78,29 @@ Session targeting
 
 Role policy
 - Role-specific workflow rules are injected automatically for supervisor and implementation sessions.
-- Supervisor owns orchestration and can decide safe cache/artifact seeding for new worktrees when useful.
-- Implementation sessions execute and verify inside their bound worktree, then report readiness and check status.
+- Supervisor primarily owns orchestration and can decide safe cache/artifact seeding for new worktrees when useful.
+- Implementation sessions usually execute in their bound worktree, and may cross paths when required by the task and allowed by agent policy.
+- Child-session workbench tasks inherit the parent session agent, so routing and permissions stay aligned.
 
 Storage
 - Registry files live under: $XDG_STATE_HOME/opencode/workbench/entries/
   (fallback: ~/.local/state/opencode/workbench/entries/)`
 
 const SUPERVISOR_HINT = `Workbench mode: this is a supervisor session.
-- Own orchestration only: planning, routing, review, and user communication.
-- MUST NOT edit child implementation files or run build/check/fmt/test/git for child-worktree changes in this session.
-- Route child implementation changes (feature/code/file work) and verification commands to the target child session, and collect results there.
+- Primary owner of orchestration: planning, routing, review, and user communication.
+- Direct reads/edits/build/check/fmt/test/git are allowed when needed and when the active agent policy permits them.
+- Prefer routing implementation-heavy code/file changes and verification commands to the target child session for clearer ownership.
 - For new/heavy worktrees, proactively decide language/tool-specific acceleration (for example seeding node_modules, cargo target, or other reusable caches) when safe for this repo.
 - Distinguish delivery paths: git-only local integration uses git worktree + git merge/rebase/cherry-pick; GitHub-integrated delivery uses gh for PR/check/merge.
 - If GitHub-integrated steps are requested, require gh installation + authentication (for example gh auth login) before continuing those steps.
 - Unless user approval is already explicit/preapproved, ask before each next step; after each completed step, report outcome and ask whether to continue.`
 
 const IMPLEMENTATION_HINT = `Workbench mode: this session is pinned to a workbench worktree.
-- Execute all implementation and repo actions for this worktree (edits/build/check/fmt/test/git) only inside this path.
+- Prefer this bound worktree as the default context for implementation and repo actions (edits/build/check/fmt/test/git).
+- Cross-path reads/edits/build actions are allowed when task requirements and active agent policy allow; keep path intent explicit in reports.
 - For git-only local delivery, use git integration commands (for example merge/rebase/cherry-pick) in local worktrees; do not depend on gh.
 - For GitHub-integrated delivery, use gh for PR/check/merge only after gh is installed and authenticated.
-- Execute only the step requested by supervisor, and report readiness/check status before merge or final delivery.`
+- Execute requested steps and report readiness/check status before merge or final delivery.`
 
 const TOOLING_MODE_HINT = `Workbench tooling policy (always apply):
 - Git is the required baseline for local parallel development and merge workflow.
@@ -218,56 +222,11 @@ const hash = (input: string) => createHash("sha1").update(input).digest("hex").s
 
 const key = (input: string) => (clean(input) || "x").toLowerCase()
 
-function fileArg(args: unknown) {
-  if (!args || typeof args !== "object" || Array.isArray(args)) return ""
-  const value = (args as Record<string, unknown>).filePath
-  if (typeof value !== "string") return ""
-  return value.trim()
-}
-
 function directoryArg(args: unknown) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return ""
   const value = (args as Record<string, unknown>).directory
   if (typeof value !== "string") return ""
   return value.trim()
-}
-
-function pathArg(args: unknown) {
-  if (!args || typeof args !== "object" || Array.isArray(args)) return ""
-  const value = (args as Record<string, unknown>).path
-  if (typeof value !== "string") return ""
-  return value.trim()
-}
-
-function workdirArg(args: unknown) {
-  if (!args || typeof args !== "object" || Array.isArray(args)) return ""
-  const value = (args as Record<string, unknown>).workdir
-  if (typeof value !== "string") return ""
-  return value.trim()
-}
-
-function isGitignore(filepath: string) {
-  const value = filepath.trim()
-  if (!value) return false
-  if (value === ".gitignore") return true
-  const normalized = value.replaceAll("\\", "/")
-  return normalized.endsWith("/.gitignore")
-}
-
-function within(base: string, target: string) {
-  const root = path.resolve(base)
-  const file = path.resolve(target)
-  const rel = path.relative(root, file)
-  if (!rel) return true
-  if (rel.startsWith("..")) return false
-  return !path.isAbsolute(rel)
-}
-
-function resolvePath(base: string, raw: string) {
-  const value = raw.trim()
-  if (!value) return ""
-  if (path.isAbsolute(value)) return path.resolve(value)
-  return path.resolve(base, value)
 }
 
 function normalizeScope(raw: unknown, all?: boolean): Scope {
@@ -1125,64 +1084,8 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
             'workbench: built-in task directory is disabled in supervisor mode. Use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.',
           )
         }
-
-        const existing = typeof args.task_id === "string" ? args.task_id.trim() : ""
-        if (existing) return
-        const routed = await resolveTaskTargetSession(base, ctx, input.sessionID)
-        if (routed) args.task_id = routed
         return
       }
-
-      const sid = String(input.sessionID || "").trim()
-      if (!sid) return
-
-      const all = await listAllLiveEntries(base)
-
-      const worker = all.find(({ entry }) => entry.session?.id === sid)
-      if (worker) {
-        const root = path.resolve(worker.entry.worktree.path)
-
-        if (input.tool === "read" || input.tool === "edit" || input.tool === "write") {
-          const target = resolvePath(root, fileArg(output.args))
-          if (target && !within(root, target)) {
-            throw new Error(
-              `workbench: ${input.tool} is restricted to ${JSON.stringify(root)} for this workbench session (got ${JSON.stringify(target)}).`,
-            )
-          }
-        }
-
-        if (input.tool === "glob" || input.tool === "grep") {
-          const target = resolvePath(root, pathArg(output.args))
-          if (target && !within(root, target)) {
-            throw new Error(
-              `workbench: ${input.tool} path is restricted to ${JSON.stringify(root)} for this workbench session (got ${JSON.stringify(target)}).`,
-            )
-          }
-        }
-
-        if (input.tool === "bash") {
-          const target = resolvePath(root, workdirArg(output.args))
-          if (target && !within(root, target)) {
-            throw new Error(
-              `workbench: bash workdir is restricted to ${JSON.stringify(root)} for this workbench session (got ${JSON.stringify(target)}).`,
-            )
-          }
-        }
-
-        return
-      }
-
-      const isSupervisor = all.some(({ entry }) => entry.session?.parent === sid)
-      if (!isSupervisor) return
-
-      if (input.tool !== "edit" && input.tool !== "write") return
-
-      const target = fileArg(output.args)
-      if (isGitignore(target)) return
-
-      throw new Error(
-        'workbench: supervisor sessions MUST NOT edit child implementation files. Route edits via workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }; only .gitignore setup edits are allowed here.',
-      )
     },
     tool: {
       workbench: tool({

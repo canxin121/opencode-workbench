@@ -263,7 +263,7 @@ async function main() {
 
   const taskParent = { args: { prompt: "p" } as Record<string, unknown> }
   await before({ tool: "task", sessionID: "ses_parent", callID: "c_task_parent" }, taskParent)
-  if (taskParent.args.task_id !== workerSession) throw new Error("task auto-routing for supervisor failed")
+  if (taskParent.args.task_id) throw new Error("task hook should not auto-route task_id in supervisor mode")
 
   const taskChild = { args: { prompt: "p" } as Record<string, unknown> }
   let childTaskBlocked = false
@@ -365,7 +365,7 @@ async function main() {
 
   const taskParent2 = { args: { prompt: "p" } as Record<string, unknown> }
   await before({ tool: "task", sessionID: "ses_parent_2", callID: "c_task_parent2" }, taskParent2)
-  if (taskParent2.args.task_id !== worktreeSession2) throw new Error("task auto-routing should follow re-parented binding session")
+  if (taskParent2.args.task_id) throw new Error("task hook should not auto-route task_id after re-parenting")
 
   const [slowTask, fastTask] = await Promise.all([
     def.execute(
@@ -410,12 +410,8 @@ async function main() {
   if (!strictInfoBlocked) throw new Error("strict info should fail when multiple bindings match")
 
   const activeWorktreeSession = worktreeSession2
-  const outsideDenied = { args: { filePath: path.join(repo, "README.md") } as Record<string, unknown> }
-  let deniedOutside = false
-  await before({ tool: "edit", sessionID: activeWorktreeSession, callID: "c_edit_worker_out" }, outsideDenied).catch(() => {
-    deniedOutside = true
-  })
-  if (!deniedOutside) throw new Error("worker boundary guard failed")
+  const outsideAllowed = { args: { filePath: path.join(repo, "README.md") } as Record<string, unknown> }
+  await before({ tool: "edit", sessionID: activeWorktreeSession, callID: "c_edit_worker_out" }, outsideAllowed)
 
   const insideAllowed = { args: { filePath: path.join(workbenchDir, "README.md") } as Record<string, unknown> }
   await before({ tool: "edit", sessionID: activeWorktreeSession, callID: "c_edit_worker_in" }, insideAllowed)
@@ -429,12 +425,8 @@ async function main() {
   const removeMissing = await def.execute(schema.parse({ action: "remove", name: "missing", dir: repo }), toolCtx)
   if (!String(removeMissing).includes("binding not found")) throw new Error("remove missing binding should be explicit")
 
-  const editDenied = { args: { filePath: path.join(repo, "README.md") } as Record<string, unknown> }
-  let denied = false
-  await before({ tool: "edit", sessionID: "ses_parent", callID: "c_edit_deny" }, editDenied).catch(() => {
-    denied = true
-  })
-  if (!denied) throw new Error("supervisor edit guard failed")
+  const editAnyAllowed = { args: { filePath: path.join(repo, "README.md") } as Record<string, unknown> }
+  await before({ tool: "edit", sessionID: "ses_parent", callID: "c_edit_deny" }, editAnyAllowed)
 
   const editAllowed = { args: { filePath: path.join(repo, ".gitignore") } as Record<string, unknown> }
   await before({ tool: "edit", sessionID: "ses_parent", callID: "c_edit_allow" }, editAllowed)
