@@ -21,13 +21,15 @@ Purpose
 
 Principles
 - Run bind/open/task from the main repository working copy on the base branch, not from child worktree directories.
-- Child worker sessions own implementation, file edits, build/check work, and conflict resolution inside their bound worktree.
-- Supervisor owns planning, routing, review, and final integration decisions.
+- Child worker sessions own detailed task planning, implementation, file edits, build/check work, and conflict resolution inside their bound worktree.
+- Supervisor owns workflow-level planning, routing, review, and final integration decisions.
 - Supervisor should not directly edit/read/build inside child-owned worktree directories; delegate via workbench { action: "task", ... }.
 
 Your role (supervisor)
 - Your role in this session is the supervisor.
-- Split work, dispatch tasks with workbench { action: "task", ... }, review outcomes, and decide next routing.
+- Plan and route work by following the Supervisor workflow below.
+- Leave detailed per-task planning to child sessions.
+- Dispatch tasks with workbench { action: "task", ... }, review outcomes, and decide next routing.
 - Perform final integration into the base branch after checks/approval.
 
 Supervisor workflow
@@ -37,7 +39,7 @@ Supervisor workflow
    workbench { action: "open", dir: ".workbench/<name>", name: "<name>" }
 3) Dispatch implementation tasks from the supervisor session:
    workbench { action: "task", dir: ".workbench/<name>", prompt: "Implement ..." }
-4) Child sessions implement, validate, and resolve conflicts in their bound worktree, then report readiness.
+4) Child sessions perform per-task detailed planning, implement, validate, and resolve conflicts in their bound worktree, then report readiness.
 5) Review task results and decide next routing.
 6) Perform final integration from supervisor flow on the base branch:
    - git-only baseline: integrate with git locally.

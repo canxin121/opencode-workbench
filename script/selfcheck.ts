@@ -183,11 +183,17 @@ async function main() {
   if (!String(helpText).includes("main repository working copy on the base branch")) {
     throw new Error("help should require running bind/open/task from main repository base branch context")
   }
+  if (!String(helpText).includes("Leave detailed per-task planning to child sessions.")) {
+    throw new Error("help should make child sessions responsible for per-task detailed planning")
+  }
   if (!String(helpText).includes("Supervisor should not directly edit/read/build inside child-owned worktree directories")) {
     throw new Error("help should define supervisor non-implementation boundary for child worktrees")
   }
   if (!String(helpText).includes("Supervisor workflow")) {
     throw new Error("help should document supervisor workflow")
+  }
+  if (!String(helpText).includes("Child sessions perform per-task detailed planning")) {
+    throw new Error("help should document that child sessions handle per-task detailed planning")
   }
   if (String(helpText).includes("Child worker contract") || String(helpText).includes("Coordinator-only access policy")) {
     throw new Error("help should not include child-session instruction sections")
