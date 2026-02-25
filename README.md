@@ -4,10 +4,10 @@ Lightweight bindings between git worktrees and OpenCode sessions for parallel de
 
 This plugin does **not** create sandboxes or sync files. Instead, it:
 
-- injects prompts that treat `git` as the primary workflow and `gh` as an optional GitHub integration
+- injects only a minimal global workbench reminder, plus a worker-session role hint for bound child sessions
 - records bindings (worktree dir, branch, session id, fork/upstream/PR metadata)
-- auto-routes built-in Task `task_id` in workbench supervisor/implementation sessions when unambiguous
-- strongly emphasizes supervisor-to-child delegation for implementation work
+- routes `workbench { action: "task" }` by worktree/session and keeps child-session execution serialized per target session
+- keeps `workbench` tool usage supervisor-only (bound child worker sessions cannot invoke `workbench` directly)
 - provides a small Studio UI that shows your bindings (session-scoped by default)
 - enforces git-only directories for bind/open/task (non-git dirs are rejected with guidance)
 
@@ -60,6 +60,7 @@ Actions:
   - supports metadata clearing via `clear: "prUrl"` or `clear: "github"`
 - `open`: create/reuse a pinned child session for a binding
 - `task`: run a prompt in a routed workbench session (optionally by `dir` or `task_id`); child prompt agent is inherited from the parent session and child permission/question requests are auto-rejected during relayed runs
+- note: bound child worker sessions cannot run `workbench` actions directly; use the supervisor session
 - `list`: list bindings (defaults to current session; use `scope: "repo"` for repo)
 - `info`: show a binding (defaults to current session)
 - `remove`: remove a binding (defaults to current session)
@@ -70,13 +71,13 @@ Name-only operations (`open/info/remove` with `name` but no `dir`) can resolve f
 Scopes:
 
 - Default is session-scoped (minimal/no noise).
-- Session scope includes current session and direct child-session bindings (supervisor-friendly).
+- Session scope includes current session and direct child-session bindings (supervisor + workers).
 - Use `scope: "repo"` to list bindings for the current git repo (if you're not inside the repo, pass `dir: "path/to/repo"`).
 - Use `scope: "all"` to list bindings across all repos.
 
 Session targeting params (optional):
 
-- `parentSessionId`: override supervisor session id (default: current session id)
+- `parentSessionId`: override supervisor/parent session id (default: current session id)
 - `sessionId`: explicit child/target session id for list/info/task lookups
 - `strict`: for `info`, fail on ambiguity instead of auto-selecting the latest binding
 
@@ -88,19 +89,17 @@ Task isolation:
 
 Suggested governance workflow:
 
-- Supervisor session focuses on orchestration; child sessions do implementation.
-- Supervisor should avoid direct implementation tools and route code/file/build/test/git work to child sessions.
-- Build/check/fmt/test should run in the target child worktree session (not supervisor) to avoid wrong-directory execution.
-- If changes are in child worktrees, supervisor-local build/check/fmt/test is usually meaningless and should be skipped.
-- Child sessions run their own `git commit`/`git push`; local merge delivery works with `git` only.
-- If GitHub integration is needed, require `gh` installation/authentication first, then run `gh` PR/check/merge steps.
-- Child reports readiness with suggested next delivery steps; supervisor decides routing.
-- For commit/push/PR/merge/cleanup milestones, supervisor should proactively confirm user approval and require green checks before merge; for local-only flow use git evidence, and for GitHub-linked flow require authenticated `gh` status/checks.
-- Unless user approval is already explicit/preapproved, supervisor should ask before each next delivery/cleanup step and, after each step result, ask whether to continue.
-- User may preapprove those delivery actions; supervisor should restate the approval in the prompt flow.
-- Prefer child-session reuse (`open/list/info` first) and only create new child sessions when necessary.
-- For cleanup actions (binding removal, storage cleanup, remote branch cleanup), supervisor should confirm with the user first unless already requested.
-- For cold-start heavy stacks, supervisor should decide and coordinate safe cache seeding into new worktrees (for example `node_modules`, `cargo target`, or other tool caches) when compatible.
+- Supervisor session owns orchestration (task split, routing, merge order, final integration).
+- Run workbench orchestration actions from the main repository working copy on the base branch, not from child worktree directories.
+- Child worker sessions own implementation and merge-readiness preparation inside their bound worktree.
+- Supervisor should not directly edit/read/build inside child-owned worktree paths; dispatch via `workbench { action: "task", ... }`.
+- Child sessions should sync with target base, resolve conflicts in the child branch, rerun checks, and report readiness evidence.
+- Child sessions should not perform final integration into the supervisor base branch.
+- Supervisor performs final integration with git (baseline) or gh (optional) after approvals/checks.
+- For git-only delivery, prefer deterministic integration (`git pull --ff-only`, then approved merge strategy).
+- For GitHub-linked delivery, require `gh` installation/authentication before PR/check/merge steps.
+- Prefer child-session reuse (`open/list/info` first) and create new child sessions only when necessary.
+- Keep cleanup actions (binding removal, worktree deletion, `.workbench/<name>` subdirectory removal, remote branch pruning) explicit and user-approved.
 
 Optional GitHub CLI modes:
 
@@ -140,8 +139,8 @@ workbench { action: "open", dir: ".workbench/feature-x", name: "feature-x" }
 
 Suggested split:
 
-- Keep the top-level session focused on orchestration (`git`, optional `gh`, `workbench`) when running parallel branches.
-- Run implementation prompts with `workbench { action: "task", ... }` so routing stays worktree-aware.
+- Keep the top-level session as supervisor (`git`, optional `gh`, `workbench`) when running parallel branches.
+- Dispatch implementation prompts with `workbench { action: "task", ... }` so routing stays worktree-aware.
 
 ```text
 workbench { action: "task", dir: ".workbench/feature-x", prompt: "Implement feature" }
@@ -153,9 +152,7 @@ If you need explicit parent+child visibility in supervisor workflows:
 workbench { action: "list", scope: "session", parentSessionId: "ses_parent", sessionId: "ses_child" }
 ```
 
-In workbench supervisor/implementation sessions, built-in `task` with `directory` is blocked; use `workbench { action: "task", ... }` instead.
-
-In workbench supervisor sessions, prefer delegation over direct implementation tool calls: use `workbench { action: "task", ... }`.
+In workbench child worker sessions, `workbench` is blocked and built-in `task` is blocked to prevent nested delegation loops; use the parent supervisor session to dispatch additional work.
 
 If routing is ambiguous, get session id and pass `task_id` explicitly:
 

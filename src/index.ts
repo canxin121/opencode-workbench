@@ -4,11 +4,10 @@ import path from "node:path"
 import os from "node:os"
 import { createHash, randomBytes } from "node:crypto"
 
-const INJECTION = `Use workbench for concurrent branch/worktree tasks.
+const INJECTION = `Use workbench when you need to supervise parallel work across branches/worktrees.
 
-- workbench binds a worktree directory to a pinned OpenCode session and stores metadata for Studio.
-- Use it when multiple tasks/branches run in parallel and you need clear per-worktree routing.
-- workbench manages routing/context metadata; path, file, and tool permissions are governed by the active agent policy.
+- It routes tasks to the right bound worktree session.
+- It is most useful when multiple tasks are active and you need explicit per-worktree routing.
 
 Help: workbench { action: "help" }`
 
@@ -17,37 +16,40 @@ const DESCRIPTION = INJECTION
 const HELP = `opencode-workbench (tool: workbench)
 
 Purpose
-- Lightweight registry for binding git worktrees to OpenCode sessions.
-- This tool does NOT create worktrees, remotes, or PRs. Use git directly for local branch/worktree delivery; use gh only as an optional GitHub integration.
-- Requires a git repository/worktree; non-git directories are rejected.
-- Records metadata (worktree path, branch, fork, PR URL) so OpenCode Studio UI can display it.
-- Includes a task action for directory-aware subagent execution in bound worktrees.
-- workbench routing does not replace agent authorization; path/file/build permissions follow the active agent policy.
+- Coordinate parallel branch/worktree execution with explicit worktree-to-session routing.
+- Bind worktree directories to reusable sessions and track metadata (branch, repo, optional PR data).
+
+Principles
+- Run bind/open/task from the main repository working copy on the base branch, not from child worktree directories.
+- Child worker sessions own implementation, file edits, build/check work, and conflict resolution inside their bound worktree.
+- Supervisor owns planning, routing, review, and final integration decisions.
+- Supervisor should not directly edit/read/build inside child-owned worktree directories; delegate via workbench { action: "task", ... }.
+
+Your role (supervisor)
+- Your role in this session is the supervisor.
+- Split work, dispatch tasks with workbench { action: "task", ... }, review outcomes, and decide next routing.
+- Perform final integration into the base branch after checks/approval.
+
+Supervisor workflow
+1) In the main repository working copy on the base branch, create/prepare worktrees (recommended under .workbench):
+   git worktree add .workbench/<name> -b <branch>
+2) Bind/open a session for each worktree:
+   workbench { action: "open", dir: ".workbench/<name>", name: "<name>" }
+3) Dispatch implementation tasks from the supervisor session:
+   workbench { action: "task", dir: ".workbench/<name>", prompt: "Implement ..." }
+4) Child sessions implement, validate, and resolve conflicts in their bound worktree, then report readiness.
+5) Review task results and decide next routing.
+6) Perform final integration from supervisor flow on the base branch:
+   - git-only baseline: integrate with git locally.
+   - git+gh optional: use gh for PR/check/merge when requested.
+7) Optional cleanup (ask user first):
+   - Ask whether to clean up bindings/worktrees/branches and .workbench/<name> subdirectories after integration.
+   - Only perform cleanup after explicit user approval.
 
 Delivery modes
-- git-only mode (baseline): core local parallel flow (worktree/commit/merge) runs with git only.
-- git+gh mode (optional): add gh commands when you want GitHub PR/check/merge integration.
-- GitHub-integrated PR/check/merge steps require gh to be installed and authenticated.
-
-When to use
-- Use workbench when multiple branches/worktrees are active in parallel and you need explicit task routing.
-
-Common workflow
-1) Ensure worktrees stay inside the repo directory:
-   Add .workbench/ to the repo's .gitignore
-2) Create a git worktree under .workbench/ (example):
-   git worktree add .workbench/feature-x feature/x
-3) Bind + open a pinned session:
-   workbench { action: "open", dir: ".workbench/feature-x", name: "feature-x" }
-4) Use workbench task when you want implementation work routed to a specific worktree session.
-   workbench { action: "task", dir: ".workbench/feature-x", prompt: "Implement feature" }
-   (task_id auto-routes when possible)
-   (task always inherits the parent session agent)
-5) Update GitHub metadata (optional):
-   workbench { action: "bind", prUrl: "https://..." }
-6) Before merge, ensure checks are green and ask user approval for merge.
-   - In git-only mode, complete local integration with git commands (for example merge/rebase/cherry-pick).
-   - In git+gh mode, ensure gh is installed/authenticated, then sync GitHub PR/CI status with gh.
+- git-only baseline: local worktree development + local integration with git.
+- git+gh optional: GitHub PR/check/merge via gh.
+- If GitHub-integrated steps are requested and gh is missing, install/authenticate gh first (for example gh auth login).
 
 Actions
 - help: show this help text
@@ -59,8 +61,8 @@ Actions
   - supports clear="prUrl" or clear="github" (comma/space-separated)
 - open: create/reuse a pinned child session for a binding
 - task: run a prompt in a routed/pinned workbench session
-  - inherits parent session agent for child-session prompts
-  - auto-rejects child permission/question requests during relayed runs to avoid blocked tool calls
+  - inherits parent session agent for delegated prompts
+  - auto-rejects delegated-session permission/question requests during relayed runs to avoid blocked tool calls
   (concurrent calls to the same target session are serialized to avoid response cross-talk)
   (output includes task_queue_ms/task_run_ms/task_queued)
   (output may include task_permission_auto_rejects/task_question_auto_rejects)
@@ -76,40 +78,14 @@ Session targeting
 - sessionId: optional child/target session id; useful when parent and child both need visibility
 - strict: for info, fail on ambiguous matches instead of choosing the latest
 
-Role policy
-- Role-specific workflow rules are injected automatically for supervisor and implementation sessions.
-- Supervisor sessions are orchestration-only: direct implementation tools (read/glob/grep/edit/write/apply_patch/bash) must be delegated to child sessions.
-- Supervisor can decide safe cache/artifact seeding for new worktrees when useful.
-- Implementation sessions usually execute in their bound worktree, and may cross paths when required by the task and allowed by agent policy.
-- Child-session workbench tasks inherit the parent session agent, so routing and permissions stay aligned.
-
 Storage
 - Registry files live under: $XDG_STATE_HOME/opencode/workbench/entries/
   (fallback: ~/.local/state/opencode/workbench/entries/)`
 
-const SUPERVISOR_HINT = `Workbench mode: this is a supervisor session.
-- Primary owner of orchestration: planning, routing, review, and user communication.
-- Do not directly perform repository implementation work in this session: no direct read/glob/grep/edit/write/apply_patch/bash for code changes, investigation, build/check/fmt/test, or git delivery tasks.
-- Delegate implementation/debug/verification to child worktree sessions via workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.
-- If no suitable child session exists, open one first with workbench { action: "open", ... }, then delegate.
-- Keep the supervisor loop strict: assign task -> wait for child result -> review -> send follow-up child task or report to user.
-- For new/heavy worktrees, proactively decide language/tool-specific acceleration (for example seeding node_modules, cargo target, or other reusable caches) when safe for this repo.
-- Distinguish delivery paths: git-only local integration uses git worktree + git merge/rebase/cherry-pick; GitHub-integrated delivery uses gh for PR/check/merge.
-- If GitHub-integrated steps are requested, require gh installation + authentication (for example gh auth login) before continuing those steps.
-- Unless user approval is already explicit/preapproved, ask before each next step; after each completed step, report outcome and ask whether to continue.`
-
-const IMPLEMENTATION_HINT = `Workbench mode: this session is pinned to a workbench worktree.
-- Prefer this bound worktree as the default context for implementation and repo actions (edits/build/check/fmt/test/git).
-- Cross-path reads/edits/build actions are allowed when task requirements and active agent policy allow; keep path intent explicit in reports.
-- For git-only local delivery, use git integration commands (for example merge/rebase/cherry-pick) in local worktrees; do not depend on gh.
-- For GitHub-integrated delivery, use gh for PR/check/merge only after gh is installed and authenticated.
-- Execute requested steps and report readiness/check status before merge or final delivery.`
-
-const TOOLING_MODE_HINT = `Workbench tooling policy (always apply):
-- Git is the required baseline for local parallel development and merge workflow.
-- gh is optional; use it only when the user wants GitHub-integrated PR/check/merge actions.
-- If a GitHub-integrated step is requested and gh is missing, require installation + authentication (for example gh auth login) before continuing that step.
-- If the user only wants local git delivery, continue with git-only flow without gh.`
+const WORKER_HINT = `Workbench mode: your role is a workbench child worker.
+- Implement and verify the assigned task in this bound worktree.
+- Keep your child branch merge-ready for the supervisor's final integration.
+- Do not perform final integration into the supervisor base branch.`
 
 type ToolingMode = "git+gh" | "git-only" | "no-git"
 
@@ -224,13 +200,6 @@ const clean = (input: string) =>
 const hash = (input: string) => createHash("sha1").update(input).digest("hex").slice(0, 10)
 
 const key = (input: string) => (clean(input) || "x").toLowerCase()
-
-function directoryArg(args: unknown) {
-  if (!args || typeof args !== "object" || Array.isArray(args)) return ""
-  const value = (args as Record<string, unknown>).directory
-  if (typeof value !== "string") return ""
-  return value.trim()
-}
 
 function normalizeScope(raw: unknown, all?: boolean): Scope {
   if (all === true) return "all"
@@ -1033,14 +1002,12 @@ async function resolveTaskTargetByDirectory(base: string, ctx: any, sessionID: s
   return ""
 }
 
-async function resolveSessionMode(base: string, sessionID?: string) {
+async function isImplementationSession(base: string, sessionID?: string) {
   const sid = String(sessionID || "").trim()
-  if (!sid) return "default" as const
+  if (!sid) return false
 
   const all = await listAllLiveEntries(base)
-  if (all.some(({ entry }) => entry.session?.id === sid)) return "implementation" as const
-  if (all.some(({ entry }) => entry.session?.parent === sid)) return "supervisor" as const
-  return "default" as const
+  return all.some(({ entry }) => entry.session?.id === sid)
 }
 
 export const WorkbenchPlugin: Plugin = async (ctx) => {
@@ -1049,18 +1016,16 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
       await relayTaskHandleEvent(ctx, input.event)
     },
     "experimental.chat.system.transform": async (input, output) => {
-      const sessionMode = await resolveSessionMode(stateHome(), input.sessionID)
       output.system.push(INJECTION)
-      output.system.push(TOOLING_MODE_HINT)
-      if (sessionMode === "supervisor") output.system.push(SUPERVISOR_HINT)
-      if (sessionMode === "implementation") output.system.push(IMPLEMENTATION_HINT)
+      if (await isImplementationSession(stateHome(), input.sessionID)) {
+        output.system.push(WORKER_HINT)
+      }
     },
     "experimental.session.compacting": async (input, output) => {
-      const sessionMode = await resolveSessionMode(stateHome(), input.sessionID)
       output.context.push(INJECTION)
-      output.context.push(TOOLING_MODE_HINT)
-      if (sessionMode === "supervisor") output.context.push(SUPERVISOR_HINT)
-      if (sessionMode === "implementation") output.context.push(IMPLEMENTATION_HINT)
+      if (await isImplementationSession(stateHome(), input.sessionID)) {
+        output.context.push(WORKER_HINT)
+      }
     },
     "tool.definition": async (input, output) => {
       if (input.toolID !== "task") return
@@ -1069,22 +1034,20 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
     "tool.execute.before": async (input, output) => {
       const base = stateHome()
 
-      if (input.tool === "task") {
-        if (!output.args || typeof output.args !== "object" || Array.isArray(output.args)) return
-        const args = output.args as Record<string, unknown>
-        const mode = await resolveSessionMode(base, input.sessionID)
-
-        if (mode === "default") return
-        if (mode === "implementation") {
+      if (input.tool === "workbench") {
+        if (await isImplementationSession(base, input.sessionID)) {
           throw new Error(
-            'workbench: built-in task is disabled in child implementation sessions. Execute work directly in this child session, or delegate from the supervisor via workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.',
+            'workbench: this tool is disabled in bound child worker sessions. Use workbench from the supervisor session.',
           )
         }
+        return
+      }
 
-        const raw = directoryArg(args)
-        if (raw) {
+      if (input.tool === "task") {
+        if (!output.args || typeof output.args !== "object" || Array.isArray(output.args)) return
+        if (await isImplementationSession(base, input.sessionID)) {
           throw new Error(
-            'workbench: built-in task directory is disabled in supervisor mode. Use workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.',
+            'workbench: built-in task is disabled in workbench child sessions. Execute work directly in this child session; request new routed work from the supervisor via workbench { action: "task", dir: ".workbench/<name>", prompt: "..." }.',
           )
         }
         return
@@ -1150,6 +1113,11 @@ export const WorkbenchPlugin: Plugin = async (ctx) => {
         },
         async execute(args, toolCtx) {
           const base = stateHome()
+
+          if (await isImplementationSession(base, toolCtx?.sessionID)) {
+            throw new Error("workbench: child worker sessions cannot call workbench directly. Use the supervisor session.")
+          }
+
           await ensureDir(path.join(base, "entries"))
           const childSessionId = sessionArg(args.sessionId)
           const parentSessionId = sessionArg(args.parentSessionId) || String(toolCtx?.sessionID || "").trim()

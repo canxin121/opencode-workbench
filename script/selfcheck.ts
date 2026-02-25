@@ -160,32 +160,71 @@ async function main() {
     ask: async () => {},
   }
 
+  const defaultSystem = { system: [] as string[] }
+  await systemTransform({ sessionID: "ses_plain" }, defaultSystem)
+  const defaultSystemText = defaultSystem.system.join("\n")
+  if (!defaultSystemText.includes("Use workbench when you need to supervise parallel work across branches/worktrees.")) {
+    throw new Error("default sessions should receive the base workbench injection")
+  }
+  if (defaultSystemText.includes("Workbench mode: your role is a workbench child worker.")) {
+    throw new Error("default sessions should not receive worker delivery guidance")
+  }
+
+  const helpText = await def.execute(schema.parse({ action: "help" }), toolCtx)
+  if (!String(helpText).includes("Purpose")) {
+    throw new Error("help should document purpose")
+  }
+  if (!String(helpText).includes("Principles")) {
+    throw new Error("help should document principles")
+  }
+  if (!String(helpText).includes("Your role (supervisor)")) {
+    throw new Error("help should document supervisor role")
+  }
+  if (!String(helpText).includes("main repository working copy on the base branch")) {
+    throw new Error("help should require running bind/open/task from main repository base branch context")
+  }
+  if (!String(helpText).includes("Supervisor should not directly edit/read/build inside child-owned worktree directories")) {
+    throw new Error("help should define supervisor non-implementation boundary for child worktrees")
+  }
+  if (!String(helpText).includes("Supervisor workflow")) {
+    throw new Error("help should document supervisor workflow")
+  }
+  if (String(helpText).includes("Child worker contract") || String(helpText).includes("Coordinator-only access policy")) {
+    throw new Error("help should not include child-session instruction sections")
+  }
+  if (!String(helpText).includes("Delivery modes")) {
+    throw new Error("help should document delivery mode policy")
+  }
+  if (!String(helpText).includes("Optional cleanup (ask user first)")) {
+    throw new Error("help should document optional cleanup with user approval")
+  }
+  if (!String(helpText).includes(".workbench/<name> subdirectories")) {
+    throw new Error("help should include optional cleanup guidance for .workbench subdirectories")
+  }
+
   const name = "sbx"
   await def.execute(schema.parse({ action: "open", name, dir: repo }), toolCtx)
   const workerSession = createdSessions[0]
   if (!workerSession) throw new Error("open did not create worker session")
 
-  const supervisorSystem = { system: [] as string[] }
-  await systemTransform({ sessionID: "ses_parent" }, supervisorSystem)
-  const supervisorSystemText = supervisorSystem.system.join("\n")
-  if (!supervisorSystemText.includes("Do not directly perform repository implementation work in this session")) {
-    throw new Error("supervisor system prompt should forbid direct implementation tools")
-  }
-  if (!supervisorSystemText.includes("Delegate implementation/debug/verification to child worktree sessions")) {
-    throw new Error("supervisor system prompt should require child-session delegation")
+  const parentSystem = { system: [] as string[] }
+  await systemTransform({ sessionID: "ses_parent" }, parentSystem)
+  const parentSystemText = parentSystem.system.join("\n")
+  if (parentSystemText.includes("Workbench mode: your role is a workbench child worker.")) {
+    throw new Error("supervisor sessions should not receive worker delivery guidance")
   }
 
-  const implementationSystem = { system: [] as string[] }
-  await systemTransform({ sessionID: workerSession }, implementationSystem)
-  const implementationSystemText = implementationSystem.system.join("\n")
-  if (!implementationSystemText.includes("Workbench mode: this session is pinned to a workbench worktree.")) {
-    throw new Error("implementation system prompt should be injected for child sessions")
+  const workerSystem = { system: [] as string[] }
+  await systemTransform({ sessionID: workerSession }, workerSystem)
+  const workerSystemText = workerSystem.system.join("\n")
+  if (!workerSystemText.includes("Workbench mode: your role is a workbench child worker.")) {
+    throw new Error("worker sessions should receive worker delivery guidance")
   }
 
   const listRepo = await def.execute(schema.parse({ action: "list", scope: "repo" }), toolCtx)
   if (!String(listRepo).includes(name)) throw new Error("repo list did not include binding")
-  const listSupervisor = await def.execute(schema.parse({ action: "list" }), toolCtx)
-  if (!String(listSupervisor).includes(name)) throw new Error("supervisor session list did not include child binding")
+  const listParent = await def.execute(schema.parse({ action: "list" }), toolCtx)
+  if (!String(listParent).includes(name)) throw new Error("parent session list did not include child binding")
   const infoSupervisorDefault = await def.execute(schema.parse({ action: "info" }), toolCtx)
   if (!String(infoSupervisorDefault).includes(name)) throw new Error("info default should follow session-scoped binding resolution")
 
@@ -254,13 +293,23 @@ async function main() {
   if (!String(openByNameNonGit).includes(name)) throw new Error("name-only open should resolve outside git cwd when unique")
 
   const toolCtxChild = { ...toolCtx, sessionID: workerSession }
-  const listSession = await def.execute(schema.parse({ action: "list" }), toolCtxChild)
-  if (!String(listSession).includes(name)) throw new Error("session list did not include binding")
+  let childWorkbenchBlocked = false
+  await def.execute(schema.parse({ action: "help" }), toolCtxChild).catch(() => {
+    childWorkbenchBlocked = true
+  })
+  if (!childWorkbenchBlocked) throw new Error("child worker session should not be able to call workbench")
 
   const before = hooks["tool.execute.before"] as
     | ((input: { tool: string; sessionID: string; callID: string }, output: { args: Record<string, unknown> }) => Promise<void>)
     | undefined
   if (!before) throw new Error("tool.execute.before hook missing")
+
+  const workbenchChildCall = { args: { action: "help" } as Record<string, unknown> }
+  let childWorkbenchBeforeBlocked = false
+  await before({ tool: "workbench", sessionID: workerSession, callID: "c_workbench_child" }, workbenchChildCall).catch(() => {
+    childWorkbenchBeforeBlocked = true
+  })
+  if (!childWorkbenchBeforeBlocked) throw new Error("tool hook should block workbench calls in child worker sessions")
 
   let nonGitBindBlocked = false
   await def.execute(schema.parse({ action: "bind", name: "bad-bind", dir: nonGitDir }), toolCtx).catch(() => {
@@ -286,25 +335,21 @@ async function main() {
 
   const taskParent = { args: { prompt: "p" } as Record<string, unknown> }
   await before({ tool: "task", sessionID: "ses_parent", callID: "c_task_parent" }, taskParent)
-  if (taskParent.args.task_id) throw new Error("task hook should not auto-route task_id in supervisor mode")
+  if (taskParent.args.task_id) throw new Error("task hook should not auto-route task_id in parent session")
 
   const taskChild = { args: { prompt: "p" } as Record<string, unknown> }
   let childTaskBlocked = false
   await before({ tool: "task", sessionID: workerSession, callID: "c_task_child" }, taskChild).catch(() => {
     childTaskBlocked = true
   })
-  if (!childTaskBlocked) throw new Error("built-in task should be blocked in implementation session")
+  if (!childTaskBlocked) throw new Error("built-in task should be blocked in worker session")
 
-  const taskByDirBlocked = {
+  const taskByDirAllowed = {
     args: {
       directory: ".workbench/w2",
     } as Record<string, unknown>,
   }
-  let blocked = false
-  await before({ tool: "task", sessionID: "ses_parent", callID: "c_task_dir" }, taskByDirBlocked).catch(() => {
-    blocked = true
-  })
-  if (!blocked) throw new Error("task directory guard failed")
+  await before({ tool: "task", sessionID: "ses_parent", callID: "c_task_dir" }, taskByDirAllowed)
 
   const workbenchDir = path.join(repo, ".workbench", "w2")
   await cmd(repo, ["git", "worktree", "add", ".workbench/w2", "-b", "w2", "-q"])
@@ -327,6 +372,10 @@ async function main() {
   if (!promptCall || promptCall?.query?.directory !== workbenchDir) throw new Error("workbench task did not pin directory")
   if (!promptCall || promptCall?.body?.agent !== toolCtx.agent) {
     throw new Error("workbench task should inherit parent agent for child-session prompt")
+  }
+  const promptText = String(promptCall?.body?.parts?.[0]?.text || "")
+  if (promptText.trim() !== "do work") {
+    throw new Error("workbench task should forward assigned prompt text without contract wrapping")
   }
 
   const toolCtxParent2 = { ...toolCtx, sessionID: "ses_parent_2" }
@@ -448,24 +497,24 @@ async function main() {
   const removeMissing = await def.execute(schema.parse({ action: "remove", name: "missing", dir: repo }), toolCtx)
   if (!String(removeMissing).includes("binding not found")) throw new Error("remove missing binding should be explicit")
 
-  const supervisorReadAllowedArgs = { args: { filePath: path.join(repo, "README.md") } as Record<string, unknown> }
-  await before({ tool: "read", sessionID: "ses_parent", callID: "c_read_supervisor" }, supervisorReadAllowedArgs)
+  const parentReadAllowedArgs = { args: { filePath: path.join(repo, "README.md") } as Record<string, unknown> }
+  await before({ tool: "read", sessionID: "ses_parent", callID: "c_read_parent" }, parentReadAllowedArgs)
 
-  const supervisorEditAllowedArgs = { args: { filePath: path.join(repo, ".gitignore") } as Record<string, unknown> }
-  await before({ tool: "edit", sessionID: "ses_parent", callID: "c_edit_supervisor" }, supervisorEditAllowedArgs)
+  const parentEditAllowedArgs = { args: { filePath: path.join(repo, ".gitignore") } as Record<string, unknown> }
+  await before({ tool: "edit", sessionID: "ses_parent", callID: "c_edit_parent" }, parentEditAllowedArgs)
 
-  const supervisorBashAllowedArgs = { args: { command: "git status" } as Record<string, unknown> }
-  await before({ tool: "bash", sessionID: "ses_parent", callID: "c_bash_supervisor" }, supervisorBashAllowedArgs)
+  const parentBashAllowedArgs = { args: { command: "git status" } as Record<string, unknown> }
+  await before({ tool: "bash", sessionID: "ses_parent", callID: "c_bash_parent" }, parentBashAllowedArgs)
 
-  await def.execute(schema.parse({ action: "bind", prUrl: "https://github.com/org/repo/pull/1" }), toolCtxChild)
-  const infoSession = await def.execute(schema.parse({ action: "info" }), toolCtxChild)
-  if (!String(infoSession).includes("pull/1")) throw new Error("session bind did not update prUrl")
+  await def.execute(schema.parse({ action: "bind", name, prUrl: "https://github.com/org/repo/pull/1" }), toolCtx)
+  const infoSession = await def.execute(schema.parse({ action: "info", name }), toolCtx)
+  if (!String(infoSession).includes("pull/1")) throw new Error("bind by name did not update prUrl")
 
   await def.execute(schema.parse({ action: "bind", name: "tmp", dir: repo }), toolCtx)
   const removeByNameNonGit = await def.execute(schema.parse({ action: "remove", name: "tmp" }), toolCtxNonGit)
   if (!String(removeByNameNonGit).includes("removed tmp")) throw new Error("name-only remove should resolve outside git cwd when unique")
 
-  await def.execute(schema.parse({ action: "remove" }), toolCtxChild)
+  await def.execute(schema.parse({ action: "remove", name }), toolCtx)
   const listRepo2 = await def.execute(schema.parse({ action: "list", scope: "repo" }), toolCtx)
   if (String(listRepo2).includes(name)) throw new Error("remove did not delete binding")
 
