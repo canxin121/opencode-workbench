@@ -166,6 +166,9 @@ async function main() {
   if (!defaultSystemText.includes("Use workbench when you need to supervise parallel work across branches/worktrees.")) {
     throw new Error("default sessions should receive the base workbench injection")
   }
+  if (!defaultSystemText.includes('If you use workbench, you must follow workbench { action: "help" } as the operating workflow.')) {
+    throw new Error("injection should require following workbench help when using workbench")
+  }
   if (defaultSystemText.includes("Workbench mode: your role is a workbench child worker.")) {
     throw new Error("default sessions should not receive worker delivery guidance")
   }
@@ -183,14 +186,32 @@ async function main() {
   if (!String(helpText).includes("main repository working copy on the base branch")) {
     throw new Error("help should require running bind/open/task from main repository base branch context")
   }
-  if (!String(helpText).includes("Leave detailed per-task planning to child sessions.")) {
+  if (!String(helpText).includes("Mandatory rule: once you use workbench, you must follow this help's workflow and role boundaries.")) {
+    throw new Error("help should make following help mandatory when using workbench")
+  }
+  if (!String(helpText).includes("plan steps must map to Supervisor workflow stages in this help")) {
+    throw new Error("help should require supervisor plans to follow the supervisor workflow")
+  }
+  if (!String(helpText).includes("must not include per-task implementation details or per-child content-summary steps")) {
+    throw new Error("help should keep per-task implementation planning out of supervisor plans")
+  }
+  if (!String(helpText).includes("Child worker sessions own detailed task planning")) {
     throw new Error("help should make child sessions responsible for per-task detailed planning")
+  }
+  if (!String(helpText).includes("If you create a plan, keep it workflow-level only (setup -> dispatch -> review/reroute -> integrate -> optional cleanup).")) {
+    throw new Error("help should force workflow-level planning when supervisor uses a plan tool")
+  }
+  if (!String(helpText).includes("Do not create per-child detailed/summary plan steps in the supervisor plan.")) {
+    throw new Error("help should block per-child detail/summary steps in supervisor plans")
   }
   if (!String(helpText).includes("Supervisor should not directly edit/read/build inside child-owned worktree directories")) {
     throw new Error("help should define supervisor non-implementation boundary for child worktrees")
   }
   if (!String(helpText).includes("Supervisor workflow")) {
     throw new Error("help should document supervisor workflow")
+  }
+  if (!String(helpText).includes("Create a supervisor workflow-level plan (stages only; no per-task implementation details).")) {
+    throw new Error("help should start workflow with supervisor-level planning stages")
   }
   if (!String(helpText).includes("Child sessions perform per-task detailed planning")) {
     throw new Error("help should document that child sessions handle per-task detailed planning")

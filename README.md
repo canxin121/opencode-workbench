@@ -89,10 +89,12 @@ Task isolation:
 
 Suggested governance workflow:
 
-- Supervisor session owns orchestration (task split, routing, merge order, final integration).
-- Supervisor follows the supervisor workflow for orchestration/routing, while each child session owns detailed planning for its assigned task.
+- Mandatory rule: once you use `workbench`, follow `workbench { action: "help" }` workflow and role boundaries.
 - Run workbench orchestration actions from the main repository working copy on the base branch, not from child worktree directories.
-- Child worker sessions own implementation and merge-readiness preparation inside their bound worktree.
+- Supervisor session owns workflow-level orchestration (routing, review, merge order, final integration).
+- If the supervisor creates a plan (including plan-tool output), plan steps should map to supervisor workflow stages only.
+- Supervisor plans should not include per-task implementation details or per-child content-summary steps.
+- Child worker sessions own detailed per-task planning and implementation details for assigned tasks in their bound worktree.
 - Supervisor should not directly edit/read/build inside child-owned worktree paths; dispatch via `workbench { action: "task", ... }`.
 - Child sessions should sync with target base, resolve conflicts in the child branch, rerun checks, and report readiness evidence.
 - Child sessions should not perform final integration into the supervisor base branch.

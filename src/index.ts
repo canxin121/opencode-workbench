@@ -8,6 +8,7 @@ const INJECTION = `Use workbench when you need to supervise parallel work across
 
 - It routes tasks to the right bound worktree session.
 - It is most useful when multiple tasks are active and you need explicit per-worktree routing.
+- If you use workbench, you must follow workbench { action: "help" } as the operating workflow.
 
 Help: workbench { action: "help" }`
 
@@ -16,35 +17,39 @@ const DESCRIPTION = INJECTION
 const HELP = `opencode-workbench (tool: workbench)
 
 Purpose
-- Coordinate parallel branch/worktree execution with explicit worktree-to-session routing.
 - Bind worktree directories to reusable sessions and track metadata (branch, repo, optional PR data).
+- Coordinate parallel branch/worktree execution through explicit worktree-to-session routing.
 
 Principles
+- Mandatory rule: once you use workbench, you must follow this help's workflow and role boundaries.
 - Run bind/open/task from the main repository working copy on the base branch, not from child worktree directories.
+- Supervisor owns workflow-level orchestration: routing, review, merge order, and final integration decisions.
+- If the supervisor creates a plan, plan steps must map to Supervisor workflow stages in this help.
+- Supervisor plans must not include per-task implementation details or per-child content-summary steps.
 - Child worker sessions own detailed task planning, implementation, file edits, build/check work, and conflict resolution inside their bound worktree.
-- Supervisor owns workflow-level planning, routing, review, and final integration decisions.
 - Supervisor should not directly edit/read/build inside child-owned worktree directories; delegate via workbench { action: "task", ... }.
 
 Your role (supervisor)
 - Your role in this session is the supervisor.
-- Plan and route work by following the Supervisor workflow below.
-- Leave detailed per-task planning to child sessions.
-- Dispatch tasks with workbench { action: "task", ... }, review outcomes, and decide next routing.
-- Perform final integration into the base branch after checks/approval.
+- If you create a plan, keep it workflow-level only (setup -> dispatch -> review/reroute -> integrate -> optional cleanup).
+- Do not create per-child detailed/summary plan steps in the supervisor plan.
+- Dispatch tasks with workbench { action: "task", ... } and let child sessions plan task details.
+- Review outcomes, decide next routing, and perform final integration into the base branch after checks/approval.
 
 Supervisor workflow
-1) In the main repository working copy on the base branch, create/prepare worktrees (recommended under .workbench):
+1) Create a supervisor workflow-level plan (stages only; no per-task implementation details).
+2) In the main repository working copy on the base branch, create/prepare worktrees (recommended under .workbench):
    git worktree add .workbench/<name> -b <branch>
-2) Bind/open a session for each worktree:
+3) Bind/open a session for each worktree:
    workbench { action: "open", dir: ".workbench/<name>", name: "<name>" }
-3) Dispatch implementation tasks from the supervisor session:
+4) Dispatch implementation tasks from the supervisor session:
    workbench { action: "task", dir: ".workbench/<name>", prompt: "Implement ..." }
-4) Child sessions perform per-task detailed planning, implement, validate, and resolve conflicts in their bound worktree, then report readiness.
-5) Review task results and decide next routing.
-6) Perform final integration from supervisor flow on the base branch:
+5) Child sessions perform per-task detailed planning, implement, validate, and resolve conflicts in their bound worktree, then report readiness.
+6) Review child outcomes and decide next routing.
+7) Perform final integration from supervisor flow on the base branch:
    - git-only baseline: integrate with git locally.
    - git+gh optional: use gh for PR/check/merge when requested.
-7) Optional cleanup (ask user first):
+8) Optional cleanup (ask user first):
    - Ask whether to clean up bindings/worktrees/branches and .workbench/<name> subdirectories after integration.
    - Only perform cleanup after explicit user approval.
 
@@ -56,8 +61,6 @@ Delivery modes
 Actions
 - help: show this help text
 - doctor: show tooling + detected repo identity
-- list: list bindings (default: current session)
-- info: show a binding (default: current session)
 - bind: create/update a binding (default: current session)
   - validates upstream/fork as OWNER/REPO and prUrl as .../pull/<number>
   - supports clear="prUrl" or clear="github" (comma/space-separated)
@@ -68,6 +71,8 @@ Actions
   (concurrent calls to the same target session are serialized to avoid response cross-talk)
   (output includes task_queue_ms/task_run_ms/task_queued)
   (output may include task_permission_auto_rejects/task_question_auto_rejects)
+- info: show a binding (default: current session)
+- list: list bindings (default: current session)
 - remove: delete a binding (default: current session)
 
 Scopes (for list)
