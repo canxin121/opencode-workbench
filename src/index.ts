@@ -8,7 +8,7 @@ const INJECTION = `Use workbench when you need to supervise parallel work across
 
 - It routes tasks to the right bound worktree session.
 - It is most useful when multiple tasks are active and you need explicit per-worktree routing.
-- If you use workbench, you must follow workbench { action: "help" } as the operating workflow.
+- If you use workbench, you must follow workbench { action: "help" } as the operating workflow, including verification gates before merge.
 
 Help: workbench { action: "help" }`
 
@@ -21,20 +21,23 @@ Purpose
 - Coordinate parallel branch/worktree execution through explicit worktree-to-session routing.
 
 Principles
-- Mandatory rule: once you use workbench, you must follow this help's workflow and role boundaries.
+- Mandatory rule: once you use workbench, you must follow this help's workflow, role boundaries, and verification gates.
 - Run bind/open/task from the main repository working copy on the base branch, not from child worktree directories.
-- Supervisor owns workflow-level orchestration: routing, review, merge order, and final integration decisions.
+- Supervisor owns workflow-level orchestration: routing, review, merge order, verification gates, and final integration decisions.
 - If the supervisor creates a plan, plan steps must map to Supervisor workflow stages in this help.
 - Supervisor plans must not include per-task implementation details or per-child content-summary steps.
-- Child worker sessions own detailed task planning, implementation, file edits, build/check work, and conflict resolution inside their bound worktree.
+- Child worker sessions own detailed task planning, implementation, file edits, build/check/fmt/test work, and conflict resolution inside their bound worktree.
+- When dispatching work, supervisor must require each child task to pass required local checks in that child worktree.
+- Do not use GitHub CI status as a child-task completion criterion; CI gates are enforced by supervisor before merge.
 - Supervisor should not directly edit/read/build inside child-owned worktree directories; delegate via workbench { action: "task", ... }.
+- Never merge/integrate when verification evidence is missing or failing.
 
 Your role (supervisor)
 - Your role in this session is the supervisor.
-- If you create a plan, keep it workflow-level only (setup -> dispatch -> review/reroute -> integrate -> optional cleanup).
+- If you create a plan, keep it workflow-level only (setup -> dispatch -> review/reroute -> verify -> integrate -> optional cleanup).
 - Do not create per-child detailed/summary plan steps in the supervisor plan.
-- Dispatch tasks with workbench { action: "task", ... } and let child sessions plan task details.
-- Review outcomes, decide next routing, and perform final integration into the base branch after checks/approval.
+- Dispatch tasks with workbench { action: "task", ... }, require child-local checks to pass, and let child sessions plan task details.
+- Enforce verification gates before integration, then review outcomes, decide next routing, and perform final integration after checks/approval.
 
 Supervisor workflow
 1) Create a supervisor workflow-level plan (stages only; no per-task implementation details).
@@ -44,19 +47,24 @@ Supervisor workflow
    workbench { action: "open", dir: ".workbench/<name>", name: "<name>" }
 4) Dispatch implementation tasks from the supervisor session:
    workbench { action: "task", dir: ".workbench/<name>", prompt: "Implement ..." }
-5) Child sessions perform per-task detailed planning, implement, validate, and resolve conflicts in their bound worktree, then report readiness.
-6) Review child outcomes and decide next routing.
-7) Perform final integration from supervisor flow on the base branch:
+   - Include required local verification in the task request (check/fmt/test and project-required validators must pass in that child worktree).
+   - Do not use GitHub CI status as the child-task completion gate.
+5) Child sessions perform per-task detailed planning, implement, run required check/fmt/test validations, and resolve conflicts in their bound worktree, then report readiness evidence and local check results.
+6) Enforce verification gates before merge:
+   - With gh: verify required PR/CI checks are green before integration.
+   - Without gh: verify required local checks (check/fmt/test and project-required validators) are green before integration.
+7) Review child outcomes and decide next routing.
+8) Perform final integration from supervisor flow on the base branch:
    - git-only baseline: integrate with git locally.
    - git+gh optional: use gh for PR/check/merge when requested.
-8) Optional cleanup (ask user first):
+9) Optional cleanup (ask user first):
    - Ask whether to clean up bindings/worktrees/branches and .workbench/<name> subdirectories after integration.
    - Only perform cleanup after explicit user approval.
 
 Delivery modes
-- git-only baseline: local worktree development + local integration with git.
-- git+gh optional: GitHub PR/check/merge via gh.
-- If GitHub-integrated steps are requested and gh is missing, install/authenticate gh first (for example gh auth login).
+- git-only baseline: local worktree development + local integration with git, merge only after local verification checks are green.
+- git+gh optional: GitHub PR/check/merge via gh, merge only after required PR/CI checks are green.
+- If GitHub-integrated steps are requested and gh is missing, install/authenticate gh first (for example gh auth login) or stay on git-only mode with local verification gates.
 
 Actions
 - help: show this help text
@@ -91,6 +99,8 @@ Storage
 
 const WORKER_HINT = `Workbench mode: your role is a workbench child worker.
 - Implement and verify the assigned task in this bound worktree.
+- Run required local checks (check/fmt/test and project-required validators) in this worktree and report results.
+- Treat passing local checks in this worktree as your readiness gate; GitHub CI status is not your task completion gate.
 - Keep your child branch merge-ready for the supervisor's final integration.
 - Do not perform final integration into the supervisor base branch.`
 

@@ -166,7 +166,7 @@ async function main() {
   if (!defaultSystemText.includes("Use workbench when you need to supervise parallel work across branches/worktrees.")) {
     throw new Error("default sessions should receive the base workbench injection")
   }
-  if (!defaultSystemText.includes('If you use workbench, you must follow workbench { action: "help" } as the operating workflow.')) {
+  if (!defaultSystemText.includes('If you use workbench, you must follow workbench { action: "help" } as the operating workflow, including verification gates before merge.')) {
     throw new Error("injection should require following workbench help when using workbench")
   }
   if (defaultSystemText.includes("Workbench mode: your role is a workbench child worker.")) {
@@ -186,7 +186,7 @@ async function main() {
   if (!String(helpText).includes("main repository working copy on the base branch")) {
     throw new Error("help should require running bind/open/task from main repository base branch context")
   }
-  if (!String(helpText).includes("Mandatory rule: once you use workbench, you must follow this help's workflow and role boundaries.")) {
+  if (!String(helpText).includes("Mandatory rule: once you use workbench, you must follow this help's workflow, role boundaries, and verification gates.")) {
     throw new Error("help should make following help mandatory when using workbench")
   }
   if (!String(helpText).includes("plan steps must map to Supervisor workflow stages in this help")) {
@@ -195,10 +195,16 @@ async function main() {
   if (!String(helpText).includes("must not include per-task implementation details or per-child content-summary steps")) {
     throw new Error("help should keep per-task implementation planning out of supervisor plans")
   }
+  if (!String(helpText).includes("supervisor must require each child task to pass required local checks")) {
+    throw new Error("help should require supervisor to request child-local checks for each delegated task")
+  }
+  if (!String(helpText).includes("Do not use GitHub CI status as a child-task completion criterion")) {
+    throw new Error("help should exclude GitHub CI as child-task completion gate")
+  }
   if (!String(helpText).includes("Child worker sessions own detailed task planning")) {
     throw new Error("help should make child sessions responsible for per-task detailed planning")
   }
-  if (!String(helpText).includes("If you create a plan, keep it workflow-level only (setup -> dispatch -> review/reroute -> integrate -> optional cleanup).")) {
+  if (!String(helpText).includes("If you create a plan, keep it workflow-level only (setup -> dispatch -> review/reroute -> verify -> integrate -> optional cleanup).")) {
     throw new Error("help should force workflow-level planning when supervisor uses a plan tool")
   }
   if (!String(helpText).includes("Do not create per-child detailed/summary plan steps in the supervisor plan.")) {
@@ -215,6 +221,18 @@ async function main() {
   }
   if (!String(helpText).includes("Child sessions perform per-task detailed planning")) {
     throw new Error("help should document that child sessions handle per-task detailed planning")
+  }
+  if (!String(helpText).includes("Do not use GitHub CI status as the child-task completion gate.")) {
+    throw new Error("workflow should prevent using GitHub CI as child-task completion gate")
+  }
+  if (!String(helpText).includes("With gh: verify required PR/CI checks are green before integration.")) {
+    throw new Error("help should require green PR/CI checks before merge when gh path is used")
+  }
+  if (!String(helpText).includes("Without gh: verify required local checks (check/fmt/test and project-required validators) are green before integration.")) {
+    throw new Error("help should require local verification gates before merge when gh is unavailable")
+  }
+  if (!String(helpText).includes("Never merge/integrate when verification evidence is missing or failing.")) {
+    throw new Error("help should forbid merge when verification evidence is missing or failing")
   }
   if (String(helpText).includes("Child worker contract") || String(helpText).includes("Coordinator-only access policy")) {
     throw new Error("help should not include child-session instruction sections")
@@ -246,6 +264,12 @@ async function main() {
   const workerSystemText = workerSystem.system.join("\n")
   if (!workerSystemText.includes("Workbench mode: your role is a workbench child worker.")) {
     throw new Error("worker sessions should receive worker delivery guidance")
+  }
+  if (!workerSystemText.includes("Run required local checks (check/fmt/test and project-required validators) in this worktree and report results.")) {
+    throw new Error("worker sessions should be guided to run required local checks and report results")
+  }
+  if (!workerSystemText.includes("Treat passing local checks in this worktree as your readiness gate; GitHub CI status is not your task completion gate.")) {
+    throw new Error("worker sessions should use local checks as readiness gate instead of GitHub CI status")
   }
 
   const listRepo = await def.execute(schema.parse({ action: "list", scope: "repo" }), toolCtx)

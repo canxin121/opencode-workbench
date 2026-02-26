@@ -89,14 +89,18 @@ Task isolation:
 
 Suggested governance workflow:
 
-- Mandatory rule: once you use `workbench`, follow `workbench { action: "help" }` workflow and role boundaries.
+- Mandatory rule: once you use `workbench`, follow `workbench { action: "help" }` workflow, role boundaries, and verification gates.
 - Run workbench orchestration actions from the main repository working copy on the base branch, not from child worktree directories.
-- Supervisor session owns workflow-level orchestration (routing, review, merge order, final integration).
+- Supervisor session owns workflow-level orchestration (routing, review, merge order, verification gates, final integration).
 - If the supervisor creates a plan (including plan-tool output), plan steps should map to supervisor workflow stages only.
 - Supervisor plans should not include per-task implementation details or per-child content-summary steps.
-- Child worker sessions own detailed per-task planning and implementation details for assigned tasks in their bound worktree.
+- Child worker sessions own detailed per-task planning/implementation and run required `check`/`fmt`/`test` (plus project-required validators) in their bound worktree.
+- When dispatching child tasks, explicitly require those local checks to pass in the child worktree before readiness handoff.
+- Do not use GitHub CI status as a child-task completion gate; CI gates belong to supervisor merge decisions.
 - Supervisor should not directly edit/read/build inside child-owned worktree paths; dispatch via `workbench { action: "task", ... }`.
-- Child sessions should sync with target base, resolve conflicts in the child branch, rerun checks, and report readiness evidence.
+- Before merge, enforce verification gates: with `gh`, required PR/CI checks must be green; without `gh`, required local checks must be green.
+- Never merge/integrate when verification evidence is missing or failing.
+- Child sessions should sync with target base, resolve conflicts in the child branch, and report readiness evidence.
 - Child sessions should not perform final integration into the supervisor base branch.
 - Supervisor performs final integration with git (baseline) or gh (optional) after approvals/checks.
 - For git-only delivery, prefer deterministic integration (`git pull --ff-only`, then approved merge strategy).
